@@ -82,17 +82,6 @@ TERMINAL_PHASES = {
     ActionPhase.TIMED_OUT,
 }
 
-PHASE_ICON = {
-    ActionPhase.SUCCEEDED: "✅",
-    ActionPhase.FAILED: "❌",
-    ActionPhase.ABORTED: "⛔️",
-    ActionPhase.TIMED_OUT: "⏰",
-    ActionPhase.RUNNING: "🔄",
-    ActionPhase.INITIALIZING: "🔄",
-    ActionPhase.WAITING_FOR_RESOURCES: "⏳",
-    ActionPhase.QUEUED: "⏳",
-}
-
 # Flat colored dot per phase, rendered via NSAttributedString (no emoji 3D).
 # User-assigned colors: green=succeeded, blue=running, orange=aborted,
 # red=failed, purple=queued.
@@ -272,10 +261,6 @@ class RunRow:
     ended: Optional[datetime]
     url: str
     task: str
-
-    @property
-    def icon(self) -> str:
-        return PHASE_ICON.get(self.phase, "•")
 
     @property
     def is_running(self) -> bool:

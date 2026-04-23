@@ -2,9 +2,8 @@
 
 ![Screenshot](screenshot.png)
 
-A small rumps app that surfaces the health of your Union.ai cluster as a
-menu bar icon. Built against the Flyte v2 SDK (`flyte` package), so it shows
-Union v2 runs — not just v1 executions.
+A small Mac app that displays the health of your Union.ai cluster as a
+menu bar icon. Built against the Flyte v2 SDK (`flyte` package).
 
 ## Menu bar icon
 
@@ -40,8 +39,7 @@ Below the run list:
 - **Refresh now** — force an immediate poll.
 - **Open Union UI** — opens your first selected project in the v2 console.
 
-At the very bottom: the host, a compact summary (`N running, M failed/20`),
-the selected scope, and when the data was last refreshed.
+At the very bottom: when the data was last refreshed.
 
 Auto-refreshes every 60 seconds.
 
