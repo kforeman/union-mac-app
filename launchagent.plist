@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.union-status</string>
+
+    <!-- Replace with the absolute path to this repo on your machine. -->
+    <key>WorkingDirectory</key>
+    <string>REPLACE_WITH_ABS_PATH_TO_REPO</string>
+
+    <!-- `which uv` — replace with your uv binary path. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_WITH_ABS_PATH_TO_UV</string>
+        <string>run</string>
+        <string>python</string>
+        <string>main.py</string>
+    </array>
+
+    <!-- uv and `union` need HOME + a PATH that contains uv. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>REPLACE_WITH_YOUR_HOME</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if the app ever crashes. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Menu bar apps must be Interactive so they can talk to the Dock. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>REPLACE_WITH_YOUR_HOME/Library/Logs/union-status.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_WITH_YOUR_HOME/Library/Logs/union-status.log</string>
+</dict>
+</plist>
