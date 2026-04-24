@@ -73,7 +73,7 @@ Prereq: [`uv`](https://github.com/astral-sh/uv). If you don't have it:
 Then:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kumare3/union-mac-app/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kforeman/union-mac-app/main/install.sh | sh
 ```
 
 That installs the `union-status` CLI into uv's tool env *and* registers a
@@ -84,7 +84,7 @@ install output.
 If you'd rather skip launchd and just run it foreground:
 
 ```bash
-uvx --from git+https://github.com/kumare3/union-mac-app union-status
+uvx --from git+https://github.com/kforeman/union-mac-app union-status
 ```
 
 ## Running from a checkout

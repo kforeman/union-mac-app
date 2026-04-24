@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # One-shot installer for union-status (macOS menu bar app).
 #
-#   curl -fsSL https://raw.githubusercontent.com/kumare3/union-mac-app/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/kforeman/union-mac-app/main/install.sh | sh
 #
 # Installs the `union-status` CLI into uv's tool env and registers a
 # per-user launchd agent so the menu bar icon appears on login.
 
 set -euo pipefail
 
-REPO="git+https://github.com/kumare3/union-mac-app"
+REPO="git+https://github.com/kforeman/union-mac-app"
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "uv is required. Install it first:" >&2
