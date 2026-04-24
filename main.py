@@ -858,22 +858,30 @@ class UnionStatusApp(rumps.App):
             self.menu.insert_before("Project", group_item)
 
     def _render_app_row(self, a: AppRow) -> None:
-        # Primary click opens the exposed endpoint; a nested submenu row
-        # opens the Union console page for inspecting the app.
+        # Primary click opens the exposed endpoint; the submenu lists both
+        # the live app URL and the Union console page so either is one click
+        # away when the row is hovered.
         plain = f"{DOT_CHAR}  {a.name}"
         item = rumps.MenuItem(plain, callback=self._make_opener(a.endpoint))
         attr = NSMutableAttributedString.alloc().init()
         attr.appendAttributedString_(
-            _attr(DOT_CHAR + "  ", color=PHASE_COLOR[ActionPhase.RUNNING])
+            _attr(DOT_CHAR + "  ", color=PHASE_COLOR.get(ActionPhase.RUNNING))
         )
         attr.appendAttributedString_(_attr(a.name))
         item._menuitem.setAttributedTitle_(attr)
-        item.add(
-            rumps.MenuItem(
-                "Open in Union console",
-                callback=self._make_opener(a.console_url),
+        if a.endpoint:
+            item.add(
+                rumps.MenuItem(
+                    "Open app", callback=self._make_opener(a.endpoint)
+                )
             )
-        )
+        if a.console_url:
+            item.add(
+                rumps.MenuItem(
+                    "Open in Union console",
+                    callback=self._make_opener(a.console_url),
+                )
+            )
         self.menu.insert_before("Project", item)
 
     def _build_window_menu(self) -> None:

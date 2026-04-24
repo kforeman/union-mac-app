@@ -42,8 +42,9 @@ click-to-open pattern:
 Below the runs, if any apps are deployed and active in that project/domain:
 
 - **Active apps** — one row per active app. Click the row to open the
-  app's exposed public endpoint. Expand the submenu for **Open in Union
-  console** to inspect it instead.
+  app's exposed public endpoint. Hover the row for a submenu with both
+  **Open app** (the live endpoint) and **Open in Union console** (to
+  inspect it).
 
 Below that:
 
