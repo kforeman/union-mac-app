@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+import asyncio
 import re
-from concurrent.futures import ThreadPoolExecutor
 
 import flyte
 import rumps
@@ -42,7 +42,8 @@ from Foundation import (
     NSSize,
 )
 from flyte.models import ActionPhase
-from flyte.remote import Action, Project, Run
+from flyte.remote import Action, App, Project, Run
+
 
 REFRESH_SECONDS = 60
 RECENT_LIMIT_PER_DOMAIN = 100
@@ -50,24 +51,7 @@ TOTAL_SHOWN = 15
 SUBMENU_RUN_CAP = 20  # max runs shown inside one group's submenu
 SUMMARY_ACTIONS = 8  # tasks shown in a per-run hover tooltip
 CONFIG_PATH = Path.home() / ".config" / "union-status" / "config.json"
-UNION_CONFIG_PATH = Path.home() / ".union" / "config.yaml"
 
-
-def _default_filter_from_union_config() -> Optional[tuple[str, str]]:
-    """Pull default (project, domain) from ~/.union/config.yaml (the same file
-    used by the Union CLI). Returns None if the file is missing/unparseable."""
-    try:
-        import yaml
-
-        data = yaml.safe_load(UNION_CONFIG_PATH.read_text()) or {}
-    except Exception:
-        return None
-    task = data.get("task") or {}
-    project = task.get("project")
-    domain = task.get("domain")
-    if project and domain:
-        return (project, domain)
-    return None
 
 # (label, hours or None for "ever"). First item is the default.
 TIME_WINDOWS: list[tuple[str, Optional[float]]] = [
@@ -311,6 +295,15 @@ class RunRow:
         return self.ended or self.started
 
 
+@dataclass
+class AppRow:
+    project: str
+    domain: str
+    name: str
+    endpoint: str
+    console_url: str
+
+
 def _parse_ts(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -359,36 +352,33 @@ def _humanize_age(dt: Optional[datetime]) -> str:
     return f"{s // 86400}d ago"
 
 
-def _load_config() -> tuple[list[tuple[str, str]], str]:
-    labels = {label for label, _ in TIME_WINDOWS}
-    default_pair = _default_filter_from_union_config()
-    fallback_pairs: list[tuple[str, str]] = [default_pair] if default_pair else []
+def _load_config() -> tuple[Optional[str], Optional[str], str]:
+    """Return (project_override, domain_override, window_label).
+
+    An explicit project/domain in config.json takes precedence over the
+    union CLI's `task.project`/`task.domain`. If the user never picks one
+    from the menu, both are None and we fall back to the union config.
+    """
+    window_labels = {label for label, _ in TIME_WINDOWS}
     try:
         data = json.loads(CONFIG_PATH.read_text())
-    except FileNotFoundError:
-        return fallback_pairs, DEFAULT_WINDOW_LABEL
     except Exception:
-        return fallback_pairs, DEFAULT_WINDOW_LABEL
-    pairs = [(f["project"], f["domain"]) for f in data.get("filters", [])]
+        return None, None, DEFAULT_WINDOW_LABEL
     window = data.get("window")
-    if window not in labels:
+    if window not in window_labels:
         window = DEFAULT_WINDOW_LABEL
-    return (pairs if pairs else fallback_pairs), window
+    return data.get("project"), data.get("domain"), window
 
 
 def _save_config(
-    filters: list[tuple[str, str]], window_label: str
+    project: Optional[str], domain: Optional[str], window_label: str
 ) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(
-        json.dumps(
-            {
-                "filters": [{"project": p, "domain": d} for p, d in filters],
-                "window": window_label,
-            },
-            indent=2,
-        )
-    )
+    payload: dict = {"window": window_label}
+    if project and domain:
+        payload["project"] = project
+        payload["domain"] = domain
+    CONFIG_PATH.write_text(json.dumps(payload, indent=2))
 
 
 def _window_hours(label: str) -> Optional[float]:
@@ -402,13 +392,18 @@ class UnionStatusApp(rumps.App):
     def __init__(self) -> None:
         super().__init__("Union", title="⚪ Union", quit_button=None)
         self.host: str = ""
+        # Scope: if the user has picked one via the Projects menu, that is
+        # persisted in config.json and overrides ~/.union/config.yaml. If
+        # not, we fall back to the union CLI's task.project/task.domain.
+        saved_project, saved_domain, window = _load_config()
+        self.project: Optional[str] = saved_project
+        self.domain: Optional[str] = saved_domain
         self.runs: list[RunRow] = []
+        self.apps: list[AppRow] = []
         self.available_pairs: list[tuple[str, str]] = []
         self.last_activity: dict[tuple[str, str], datetime] = {}
         # Per-run recent-task summary, keyed by (project, domain, run_name).
         self.summary_cache: dict[tuple[str, str, str], list[ActionLite]] = {}
-        filters, window = _load_config()
-        self.filters: set[tuple[str, str]] = set(filters)
         self.window_label: str = window
         self.error: Optional[str] = None
         self.last_refresh: Optional[datetime] = None
@@ -416,7 +411,7 @@ class UnionStatusApp(rumps.App):
         self._pending_render = False
         self._flyte_ready = False
 
-        self._projects_menu = rumps.MenuItem("Projects")
+        self._projects_menu = rumps.MenuItem("Project")
         self._window_menu = rumps.MenuItem("Time window")
         self.menu = [
             "Loading…",
@@ -455,25 +450,12 @@ class UnionStatusApp(rumps.App):
     def _on_open_ui(self, _sender) -> None:
         if not self.host:
             return
-        if self.filters:
-            p, d = sorted(self.filters)[0]
-            webbrowser.open(f"https://{self.host}/v2/domain/{d}/project/{p}/")
+        if self.project and self.domain:
+            webbrowser.open(
+                f"https://{self.host}/v2/domain/{self.domain}/project/{self.project}/"
+            )
         else:
             webbrowser.open(f"https://{self.host}/v2/")
-
-    def _on_toggle_filter(self, sender) -> None:
-        pair = getattr(sender, "_pair", None)
-        if pair is None:
-            return
-        if pair in self.filters:
-            self.filters.remove(pair)
-            sender.state = 0
-        else:
-            self.filters.add(pair)
-            sender.state = 1
-        _save_config(sorted(self.filters), self.window_label)
-        self.title = "⏳ Union"
-        self._kick_refresh()
 
     def _on_pick_window(self, sender) -> None:
         label = getattr(sender, "_label", None)
@@ -482,10 +464,29 @@ class UnionStatusApp(rumps.App):
         self.window_label = label
         for key in self._window_menu.keys():
             self._window_menu[key].state = 1 if key == label else 0
-        _save_config(sorted(self.filters), self.window_label)
-        # Filtering is applied at render time; no need to refetch.
+        _save_config(self.project, self.domain, self.window_label)
+        # Time-window filtering is applied at render time; no refetch needed.
         with self._lock:
             self._pending_render = True
+
+    def _on_pick_project(self, sender) -> None:
+        pair = getattr(sender, "_pair", None)
+        if pair is None:
+            return
+        new_project, new_domain = pair
+        if new_project == self.project and new_domain == self.domain:
+            return
+        self.project = new_project
+        self.domain = new_domain
+        _save_config(self.project, self.domain, self.window_label)
+        # Force re-init on the next refresh (happens on the worker thread so
+        # the UI stays responsive while auth/networking runs).
+        with self._lock:
+            self._flyte_ready = False
+            self.runs = []
+            self.apps = []
+        self.title = "⏳ Union"
+        self._kick_refresh()
 
     # ---------- refresh ----------
 
@@ -495,95 +496,101 @@ class UnionStatusApp(rumps.App):
     def _refresh(self) -> None:
         try:
             if not self._flyte_ready:
-                flyte.init_from_config()
+                # Passing project/domain overrides the union-config defaults.
+                # If both are None, init_from_config reads task.project and
+                # task.domain from ~/.union/config.yaml.
+                flyte.init_from_config(
+                    project=self.project, domain=self.domain
+                )
                 self._flyte_ready = True
-                from flyte._initialize import get_client
+                from flyte._initialize import get_client, get_init_config
 
                 endpoint = get_client().endpoint or ""
                 self.host = urlparse(endpoint).netloc or endpoint
+                cfg = get_init_config()
+                # Adopt the resolved values so the menu's Showing: line and
+                # the Project picker reflect what Flyte actually ended up
+                # scoped to (important on first launch when the user hasn't
+                # picked yet and we're using yaml defaults).
+                self.project = cfg.project
+                self.domain = cfg.domain
 
-            projects = list(Project.listall())
+            # Cluster-wide project list, for the Project picker. Cheap; one
+            # paginated call. Failures here shouldn't block runs/apps.
             available: list[tuple[str, str]] = []
-            for p in projects:
-                pdata = p.to_dict()
-                pid = pdata.get("id") or pdata.get("name")
-                domains = pdata.get("domains") or [{"id": "development"}]
-                for d in domains:
-                    did = d.get("id") or d.get("name")
-                    if pid and did:
-                        available.append((pid, did))
-            available.sort()
+            try:
+                for p in Project.listall():
+                    pdata = p.to_dict()
+                    pid = pdata.get("id") or pdata.get("name")
+                    domains = pdata.get("domains") or [{"id": "development"}]
+                    for d in domains:
+                        did = d.get("id") or d.get("name")
+                        if pid and did:
+                            available.append((pid, did))
+                available.sort()
+            except Exception:
+                pass
+
+            if not self.project or not self.domain:
+                with self._lock:
+                    self.runs = []
+                    self.apps = []
+                    self.available_pairs = available
+                    self.error = (
+                        "No project/domain configured — pick one under Project"
+                        if available
+                        else "No project/domain in ~/.union/config.yaml "
+                        "(set task.project and task.domain)"
+                    )
+                    self.last_refresh = datetime.now(timezone.utc)
+                    self._pending_render = True
+                return
 
             rows: list[RunRow] = []
-            for pair in available:
-                if pair not in self.filters:
-                    continue
-                p, d = pair
-                try:
-                    for r in Run.listall(
-                        project=p,
-                        domain=d,
-                        limit=RECENT_LIMIT_PER_DOMAIN,
-                        sort_by=("created_at", "desc"),
-                    ):
-                        started, ended = _parse_times(r)
-                        rows.append(
-                            RunRow(
-                                project=p,
-                                domain=d,
-                                name=r.name,
-                                phase=r.phase,
-                                started=started,
-                                ended=ended,
-                                url=r.url,
-                                task=_task_name(r),
-                            )
-                        )
-                except Exception:
-                    continue
+            for r in Run.listall(
+                limit=RECENT_LIMIT_PER_DOMAIN,
+                sort_by=("created_at", "desc"),
+            ):
+                started, ended = _parse_times(r)
+                rows.append(
+                    RunRow(
+                        project=self.project,
+                        domain=self.domain,
+                        name=r.name,
+                        phase=r.phase,
+                        started=started,
+                        ended=ended,
+                        url=r.url,
+                        task=_task_name(r),
+                    )
+                )
 
             rows.sort(
                 key=lambda x: x.started or datetime.min.replace(tzinfo=timezone.utc),
                 reverse=True,
             )
 
-            # For the project picker: last-activity timestamp per pair. For
-            # selected pairs we already have the full run list; for the rest
-            # we probe a single most-recent run in parallel.
-            last_activity: dict[tuple[str, str], datetime] = {}
-            for row in rows:
-                pair = (row.project, row.domain)
-                ts = row.last_activity()
-                if ts and (pair not in last_activity or ts > last_activity[pair]):
-                    last_activity[pair] = ts
-
-            to_probe = [p for p in available if p not in self.filters]
-
-            def _probe(pair: tuple[str, str]):
-                p, d = pair
-                try:
-                    for r in Run.listall(
-                        project=p,
-                        domain=d,
-                        limit=1,
-                        sort_by=("created_at", "desc"),
-                    ):
-                        st, en = _parse_times(r)
-                        return pair, en or st
-                except Exception:
-                    pass
-                return pair, None
-
-            if to_probe:
-                with ThreadPoolExecutor(max_workers=8) as pool:
-                    for pair, ts in pool.map(_probe, to_probe):
-                        if ts is not None:
-                            last_activity[pair] = ts
+            # Active apps in the current project/domain. App.listall is already
+            # scoped by the init'd cfg.project/cfg.domain, so no extra filter
+            # is needed.
+            apps: list[AppRow] = []
+            for a in App.listall(limit=200):
+                if not a.is_active():
+                    continue
+                apps.append(
+                    AppRow(
+                        project=a.pb2.metadata.id.project,
+                        domain=a.pb2.metadata.id.domain,
+                        name=a.name,
+                        endpoint=a.endpoint,
+                        console_url=a.url,
+                    )
+                )
 
             with self._lock:
                 self.runs = rows
+                self.apps = apps
                 self.available_pairs = available
-                self.last_activity = last_activity
                 self.error = None
                 self.last_refresh = datetime.now(timezone.utc)
                 self._pending_render = True
@@ -625,14 +632,15 @@ class UnionStatusApp(rumps.App):
         if not to_fetch:
             return
 
-        def _summary_of(row: RunRow) -> tuple[RunRow, Optional[list[ActionLite]]]:
+        async def _summary_of(
+            row: RunRow,
+        ) -> tuple[RunRow, Optional[list[ActionLite]]]:
             try:
                 actions: list[ActionLite] = []
-                for i, a in enumerate(
-                    Action.listall(
-                        for_run_name=row.name,
-                        sort_by=("created_at", "desc"),
-                    )
+                i = 0
+                async for a in Action.listall.aio(
+                    for_run_name=row.name,
+                    sort_by=("created_at", "desc"),
                 ):
                     if i >= SUMMARY_ACTIONS:
                         break
@@ -644,15 +652,23 @@ class UnionStatusApp(rumps.App):
                             start_time=getattr(a, "start_time", None),
                         )
                     )
+                    i += 1
                 return row, actions or None
             except Exception:
                 return row, None
 
+        async def _fetch_all() -> list[tuple[RunRow, Optional[list[ActionLite]]]]:
+            return await asyncio.gather(*(_summary_of(r) for r in to_fetch))
+
+        # Run the fan-out on a fresh loop. We're in a worker thread here (the
+        # rumps/Cocoa main thread has its own event loop that we mustn't touch),
+        # so asyncio.run is safe: it creates + tears down its own loop.
+        results = asyncio.run(_fetch_all())
+
         new: dict[tuple[str, str, str], list[ActionLite]] = {}
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for row, summary in pool.map(_summary_of, to_fetch):
-                if summary:
-                    new[(row.project, row.domain, row.name)] = summary
+        for row, summary in results:
+            if summary:
+                new[(row.project, row.domain, row.name)] = summary
 
         if not new:
             return
@@ -666,24 +682,35 @@ class UnionStatusApp(rumps.App):
     def _render(self) -> None:
         with self._lock:
             all_runs = list(self.runs)
+            all_apps = list(self.apps)
             available = list(self.available_pairs)
-            last_activity = dict(self.last_activity)
             error = self.error
             last_refresh = self.last_refresh
 
-        static = {"Projects", "Time window", "Refresh now", "Open Union UI", "Quit"}
+        static = {"Project", "Time window", "Refresh now", "Open Union UI", "Quit"}
         for key in list(self.menu.keys()):
             if key not in static:
                 del self.menu[key]
 
-        self._rebuild_projects_menu(available, last_activity)
+        self._build_projects_menu(available)
+
+        # Header (top of menu): which project/domain we're showing. Inserted
+        # first so it ends up above everything else. insert_before places
+        # items right before the anchor in FIFO order, so the first call is
+        # farthest from the anchor.
+        if self.project and self.domain:
+            self.menu.insert_before(
+                "Project",
+                rumps.MenuItem(f"Showing: {self.project}/{self.domain}"),
+            )
+            self.menu.insert_before("Project", None)
 
         if error:
             self.title = "⚠️ Union"
             self.menu.insert_before(
-                "Projects", rumps.MenuItem(f"Error: {error[:80]}")
+                "Project", rumps.MenuItem(f"Error: {error[:100]}")
             )
-            self.menu.insert_before("Projects", None)
+            self.menu.insert_before("Project", None)
             return
 
         # Time-window filter. A run qualifies if it is currently running, or if
@@ -703,9 +730,6 @@ class UnionStatusApp(rumps.App):
 
         running = sum(1 for r in runs if r.is_running)
         terminal_runs = [r for r in runs if r.phase in TERMINAL_PHASES]
-        failed = sum(
-            1 for r in terminal_runs[:20] if r.phase != ActionPhase.SUCCEEDED
-        )
         if running:
             icon_phase = ActionPhase.RUNNING
         elif terminal_runs:
@@ -720,20 +744,23 @@ class UnionStatusApp(rumps.App):
             icon_phase = None
         self._set_status_title(icon_phase, "Union")
 
-        if not self.filters:
+        if not runs:
             self.menu.insert_before(
-                "Projects",
-                rumps.MenuItem("No projects selected — pick one under Projects"),
-            )
-        elif not runs:
-            self.menu.insert_before(
-                "Projects",
+                "Project",
                 rumps.MenuItem(f"No runs in {self.window_label.lower()}"),
             )
         else:
             self._render_groups(runs)
 
-        self.menu.insert_before("Projects", None)
+        if all_apps:
+            self.menu.insert_before("Project", None)
+            self.menu.insert_before(
+                "Project", rumps.MenuItem("Active apps")
+            )
+            for a in sorted(all_apps, key=lambda x: x.name):
+                self._render_app_row(a)
+
+        self.menu.insert_before("Project", None)
 
         # Footer: just the last-refresh timestamp, rendered above Quit.
         if last_refresh:
@@ -828,7 +855,26 @@ class UnionStatusApp(rumps.App):
                 sub_item._menuitem.setAttributedTitle_(sub_attr)
                 group_item.add(sub_item)
 
-            self.menu.insert_before("Projects", group_item)
+            self.menu.insert_before("Project", group_item)
+
+    def _render_app_row(self, a: AppRow) -> None:
+        # Primary click opens the exposed endpoint; a nested submenu row
+        # opens the Union console page for inspecting the app.
+        plain = f"{DOT_CHAR}  {a.name}"
+        item = rumps.MenuItem(plain, callback=self._make_opener(a.endpoint))
+        attr = NSMutableAttributedString.alloc().init()
+        attr.appendAttributedString_(
+            _attr(DOT_CHAR + "  ", color=PHASE_COLOR[ActionPhase.RUNNING])
+        )
+        attr.appendAttributedString_(_attr(a.name))
+        item._menuitem.setAttributedTitle_(attr)
+        item.add(
+            rumps.MenuItem(
+                "Open in Union console",
+                callback=self._make_opener(a.console_url),
+            )
+        )
+        self.menu.insert_before("Project", item)
 
     def _build_window_menu(self) -> None:
         for label, _ in TIME_WINDOWS:
@@ -837,30 +883,26 @@ class UnionStatusApp(rumps.App):
             item.state = 1 if label == self.window_label else 0
             self._window_menu[label] = item
 
-    def _rebuild_projects_menu(
-        self,
-        available: list[tuple[str, str]],
-        last_activity: dict[tuple[str, str], datetime],
+    def _build_projects_menu(
+        self, available: list[tuple[str, str]]
     ) -> None:
         for key in list(self._projects_menu.keys()):
             del self._projects_menu[key]
-
-        keys = sorted(
-            set(available) | self.filters,
-            key=lambda pair: (
-                last_activity.get(pair) or datetime.min.replace(tzinfo=timezone.utc),
-                pair,
-            ),
-            reverse=True,
-        )
-        for pair in keys:
+        # Include the current pick even if the cluster listing failed or
+        # hasn't returned yet, so the radio state is always correct.
+        pairs = sorted(set(available) | {
+            (self.project, self.domain) if self.project and self.domain else None
+        } - {None})
+        if not pairs:
+            placeholder = rumps.MenuItem("Loading…")
+            self._projects_menu["Loading…"] = placeholder
+            return
+        for pair in pairs:
             p, d = pair
-            age = last_activity.get(pair)
-            suffix = f"    {_humanize_age(age)}" if age else "    —"
-            label = f"{p}/{d}{suffix}"
-            item = rumps.MenuItem(label, callback=self._on_toggle_filter)
+            label = f"{p}/{d}"
+            item = rumps.MenuItem(label, callback=self._on_pick_project)
             item._pair = pair
-            item.state = 1 if pair in self.filters else 0
+            item.state = 1 if pair == (self.project, self.domain) else 0
             self._projects_menu[label] = item
 
     def _set_status_title(self, icon_phase, text: str) -> None:

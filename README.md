@@ -21,9 +21,12 @@ time window).
 
 ## Menu contents
 
-Top of the menu: one row per task (workflow function) in the window. Each
-row shows the task name plus a strip of up to 10 flat colored dots — the
-status of the last N runs, oldest on the left, newest on the right.
+At the top: **Showing: `{project}/{domain}`** — the scope the app is
+reading from (taken from your Union config).
+
+Then: one row per task (workflow function) in the window. Each row shows
+the task name plus a strip of up to 10 flat colored dots — the status of
+the last N runs, oldest on the left, newest on the right.
 
 Three layers of drill-down, all using the same hover-to-expand,
 click-to-open pattern:
@@ -36,33 +39,62 @@ click-to-open pattern:
 - **Task row** (e.g. `mud-splink.train_or_load_splink`) — *click* opens
   the Union page deeplinked to that task within its run.
 
-Below the run list:
+Below the runs, if any apps are deployed and active in that project/domain:
 
-- **Projects ▶** — checkable list of every `{project}/{domain}` on the
-  cluster, sorted by most-recent activity with the age of the last run
-  shown next to each entry. Toggle to add/remove from the view.
+- **Active apps** — one row per active app. Click the row to open the
+  app's exposed public endpoint. Expand the submenu for **Open in Union
+  console** to inspect it instead.
+
+Below that:
+
+- **Project ▶** — radio-style list of every `{project}/{domain}` on the
+  cluster. Click one to switch scope live; the app re-inits against that
+  project and the pick is persisted in `~/.config/union-status/config.json`.
 - **Time window ▶** — radio-style picker: last 1h / 6h / 12h / 24h / 3d /
   1w / Ever. A run counts if it's currently in progress *or* it started or
   ended inside the window. Default: 24 hours.
 - **Refresh now** — force an immediate poll.
-- **Open Union UI** — opens your first selected project in the v2 console.
+- **Open Union UI** — opens the current project in the v2 console.
 
 At the very bottom: when the data was last refreshed.
 
 Auto-refreshes every 60 seconds.
 
-## Authentication and defaults
+## Authentication and scope
 
-Credentials and the default project/domain are read from
+Credentials, endpoint, and the project/domain scope are all read from
 `~/.union/config.yaml` — the same file the `union` CLI uses. No keys or
 endpoints live in this repo.
 
-On first launch the app seeds its filter from the `task.project` and
-`task.domain` keys in that file (e.g. `onboarding/development`). After
-that your picks live in `~/.config/union-status/config.json` and persist
-across launches.
+On first launch the app scopes itself to the `task.project` and
+`task.domain` set in that config. To switch later, use the **Project ▶**
+submenu — the choice is saved in `~/.config/union-status/config.json`
+(alongside the time-window pick) and overrides the union-config default on
+subsequent launches. Clearing that file reverts to the union-config default.
 
-## Running
+## Install (one line)
+
+Prereq: [`uv`](https://github.com/astral-sh/uv). If you don't have it:
+`curl -LsSf https://astral.sh/uv/install.sh | sh`.
+
+Then:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kforeman/union-mac-app/main/install.sh | sh
+```
+
+That installs the `union-status` CLI into uv's tool env *and* registers a
+launchd agent so the menu bar icon appears on login (and after crashes).
+Re-run to upgrade. Uninstall with the command printed at the end of the
+install output.
+
+If you'd rather skip launchd and just run it foreground:
+
+```bash
+uvx --from git+https://github.com/kforeman/union-mac-app union-status
+```
+
+## Running from a checkout
 
 ```bash
 uv run python main.py
@@ -74,60 +106,46 @@ To run detached so it survives terminal close:
 nohup uv run python main.py >/tmp/union-status.log 2>&1 &
 ```
 
-## Launch at login (macOS)
+## Managing the launchd agent
 
-A `launchagent.plist` template is included. It uses launchd so macOS starts
-the app at login and restarts it if it crashes.
-
-1. Copy the template and pick a unique label (reverse-DNS is convention):
-   ```bash
-   LABEL=com.$(whoami).union-status
-   cp launchagent.plist ~/Library/LaunchAgents/$LABEL.plist
-   ```
-
-2. Fill in the placeholders in that file:
-   - `REPLACE_WITH_ABS_PATH_TO_REPO` → `pwd` of this checkout
-   - `REPLACE_WITH_ABS_PATH_TO_UV` → output of `which uv`
-   - `REPLACE_WITH_YOUR_HOME` → output of `echo $HOME`
-   - Change the `Label` string to match `$LABEL`
-
-   One-liner (BSD/macOS `sed`):
-   ```bash
-   sed -i '' \
-     -e "s|REPLACE_WITH_ABS_PATH_TO_REPO|$(pwd)|g" \
-     -e "s|REPLACE_WITH_ABS_PATH_TO_UV|$(which uv)|g" \
-     -e "s|REPLACE_WITH_YOUR_HOME|$HOME|g" \
-     -e "s|com.example.union-status|$LABEL|g" \
-     ~/Library/LaunchAgents/$LABEL.plist
-   ```
-
-3. Load it into launchd:
-   ```bash
-   launchctl load -w ~/Library/LaunchAgents/$LABEL.plist
-   ```
-
-4. Verify (the first column is the PID when running, `-` when stopped):
-   ```bash
-   launchctl list | grep union-status
-   tail -f ~/Library/Logs/union-status.log
-   ```
-
-### Managing the agent
+The one-line installer writes `~/Library/LaunchAgents/com.<user>.union-status.plist`.
 
 ```bash
-# Stop it now (won't relaunch until next login or reload)
-launchctl unload ~/Library/LaunchAgents/$LABEL.plist
+LABEL=com.$(whoami).union-status
+PLIST=~/Library/LaunchAgents/$LABEL.plist
 
-# Start it again without rebooting
-launchctl load -w ~/Library/LaunchAgents/$LABEL.plist
+# Status (PID in first column when running, '-' when stopped)
+launchctl list | grep union-status
 
-# Remove entirely
-launchctl unload ~/Library/LaunchAgents/$LABEL.plist
-rm ~/Library/LaunchAgents/$LABEL.plist
+# Stop / start without rebooting
+launchctl unload $PLIST
+launchctl load -w $PLIST
+
+# Tail logs
+tail -f ~/Library/Logs/union-status.log
 ```
 
-After editing `main.py` you need to `unload` and `load` the agent (or just
-`kill` the Python process — launchd will relaunch it thanks to `KeepAlive`).
+Re-running the installer automatically unloads/reloads launchd, so upgrades
+take effect within a few seconds.
+
+## Uninstall
+
+```bash
+LABEL=com.$(whoami).union-status
+launchctl unload ~/Library/LaunchAgents/$LABEL.plist 2>/dev/null || true
+rm -f ~/Library/LaunchAgents/$LABEL.plist
+uv tool uninstall union-status
+```
+
+That removes the launchd agent, the plist, and the `union-status` binary.
+Also optional — your persisted preferences (window choice, picked project):
+
+```bash
+rm -rf ~/.config/union-status
+```
+
+The app never touches `~/.union/config.yaml`, so your Union CLI auth stays
+put.
 
 ## Tunables
 
