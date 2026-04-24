@@ -28,9 +28,16 @@ Then: one row per task (workflow function) in the window. Each row shows
 the task name plus a strip of up to 10 flat colored dots — the status of
 the last N runs, oldest on the left, newest on the right.
 
-- Click a row to jump straight to the **latest** run in the Union v2 console.
-- Hover the row to expand a submenu of every run in the group; click any
-  run to open just that one.
+Three layers of drill-down, all using the same hover-to-expand,
+click-to-open pattern:
+
+- **Group row** (e.g. `run_er_and_enrich`) — *click* opens the latest run
+  in the Union v2 console; *hover* reveals the runs in the group.
+- **Run row** (e.g. `rhgrxvh7k9tq8lpnh26j  2m ago`) — *click* opens that
+  specific run; *hover* reveals the most recent tasks inside it (lazily
+  fetched after each refresh and cached).
+- **Task row** (e.g. `mud-splink.train_or_load_splink`) — *click* opens
+  the Union page deeplinked to that task within its run.
 
 Below the runs, if any apps are deployed and active in that project/domain:
 
@@ -149,6 +156,8 @@ A few knobs live at the top of [main.py](main.py):
   refresh (default 100, sorted newest-first)
 - `TOTAL_SHOWN` — max task groups displayed in the menu
 - `DOT_STRIP_MAX` — max dots per group row
+- `SUBMENU_RUN_CAP` — max runs shown inside one group's submenu
+- `SUMMARY_ACTIONS` — number of recent tasks shown inside one run's submenu
 - `TIME_WINDOWS` / `DEFAULT_WINDOW_LABEL` — edit the time-window submenu
 
 ## License
