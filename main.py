@@ -42,11 +42,13 @@ from Foundation import (
     NSSize,
 )
 from flyte.models import ActionPhase
-from flyte.remote import Project, Run
+from flyte.remote import Action, Project, Run
 
 REFRESH_SECONDS = 60
 RECENT_LIMIT_PER_DOMAIN = 100
 TOTAL_SHOWN = 15
+SUBMENU_RUN_CAP = 20  # max runs shown inside one group's submenu
+SUMMARY_ACTIONS = 8  # tasks shown in a per-run hover tooltip
 CONFIG_PATH = Path.home() / ".config" / "union-status" / "config.json"
 UNION_CONFIG_PATH = Path.home() / ".union" / "config.yaml"
 
@@ -334,6 +336,37 @@ def _task_name(run: Run) -> str:
         return ""
 
 
+_PHASE_GLYPH = {
+    "SUCCEEDED": "✓",
+    "FAILED": "✗",
+    "ABORTED": "⊘",
+    "TIMED_OUT": "⏱",
+    "RUNNING": "→",
+    "INITIALIZING": "→",
+    "QUEUED": "·",
+    "WAITING_FOR_RESOURCES": "·",
+}
+
+
+def _format_action_summary(actions: list) -> Optional[str]:
+    if not actions:
+        return None
+    lines = ["Recent tasks:"]
+    for a in actions:
+        glyph = _PHASE_GLYPH.get(a.phase.name, "•")
+        task = (getattr(a, "task_name", None) or a.name or "")[:60]
+        when = (
+            _humanize_age(a.start_time)
+            if getattr(a, "start_time", None)
+            else ""
+        )
+        bits = [glyph, task]
+        if when:
+            bits.append(f"({when})")
+        lines.append(" ".join(bits))
+    return "\n".join(lines)
+
+
 def _humanize_age(dt: Optional[datetime]) -> str:
     if dt is None:
         return ""
@@ -393,6 +426,8 @@ class UnionStatusApp(rumps.App):
         self.runs: list[RunRow] = []
         self.available_pairs: list[tuple[str, str]] = []
         self.last_activity: dict[tuple[str, str], datetime] = {}
+        # Per-run task summary, keyed by (project, domain, run_name).
+        self.summary_cache: dict[tuple[str, str, str], str] = {}
         filters, window = _load_config()
         self.filters: set[tuple[str, str]] = set(filters)
         self.window_label: str = window
@@ -573,11 +608,72 @@ class UnionStatusApp(rumps.App):
                 self.error = None
                 self.last_refresh = datetime.now(timezone.utc)
                 self._pending_render = True
+
+            # Lazily fetch per-run task summaries for the runs the menu will
+            # actually display. Runs in progress are always re-fetched; finished
+            # runs are cached for the life of the process.
+            self._refresh_run_summaries(rows)
         except Exception as exc:  # noqa: BLE001
             with self._lock:
                 self.error = f"{type(exc).__name__}: {exc}"
                 self.last_refresh = datetime.now(timezone.utc)
                 self._pending_render = True
+
+    def _refresh_run_summaries(self, rows: list[RunRow]) -> None:
+        # Mirror the menu's grouping/cap so we only fetch what the user can see.
+        groups: dict[tuple[str, str, str], list[RunRow]] = {}
+        for r in rows:
+            key = (r.project, r.domain, r.task or r.name)
+            groups.setdefault(key, []).append(r)
+
+        visible: list[RunRow] = []
+        for rs in groups.values():
+            rs.sort(
+                key=lambda r: r.last_activity()
+                or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            visible.extend(rs[:SUBMENU_RUN_CAP])
+
+        with self._lock:
+            cached = set(self.summary_cache.keys())
+
+        to_fetch = [
+            r
+            for r in visible
+            if r.is_running or (r.project, r.domain, r.name) not in cached
+        ]
+        if not to_fetch:
+            return
+
+        def _summary_of(row: RunRow) -> tuple[RunRow, Optional[str]]:
+            try:
+                actions: list = []
+                for i, a in enumerate(
+                    Action.listall(
+                        for_run_name=row.name,
+                        sort_by=("created_at", "desc"),
+                    )
+                ):
+                    if i >= SUMMARY_ACTIONS:
+                        break
+                    actions.append(a)
+                return row, _format_action_summary(actions)
+            except Exception:
+                return row, None
+
+        new: dict[tuple[str, str, str], str] = {}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for row, summary in pool.map(_summary_of, to_fetch):
+                if summary:
+                    new[(row.project, row.domain, row.name)] = summary
+
+        if not new:
+            return
+
+        with self._lock:
+            self.summary_cache.update(new)
+            self._pending_render = True
 
     # ---------- render ----------
 
@@ -696,8 +792,8 @@ class UnionStatusApp(rumps.App):
                 _build_group_title(task, recent_phases)
             )
 
-            # Expandable submenu with each run in the group.
-            for r in rs:
+            # Expandable submenu with each run in the group (capped).
+            for r in rs[:SUBMENU_RUN_CAP]:
                 sub_plain = (
                     f"{DOT_CHAR}  {r.name}  {_humanize_age(r.last_activity())}"
                 )
@@ -711,6 +807,9 @@ class UnionStatusApp(rumps.App):
                 sub_attr.appendAttributedString_(
                     _attr(f"{r.name}  {_humanize_age(r.last_activity())}")
                 )
+                summary = self.summary_cache.get((r.project, r.domain, r.name))
+                if summary:
+                    sub_item._menuitem.setToolTip_(summary)
                 sub_item._menuitem.setAttributedTitle_(sub_attr)
                 group_item.add(sub_item)
 

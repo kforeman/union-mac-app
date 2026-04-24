@@ -3,7 +3,7 @@
 ![Screenshot](screenshot.png)
 
 A small Mac app that displays the health of your Union.ai cluster as a
-menu bar icon. Built against the Flyte v2 SDK (`flyte` package).
+menu bar icon. Built against the Flyte v2 SDK (`flyte` package) and `[rumps](https://github.com/jaredks/rumps)`.
 
 ## Menu bar icon
 
