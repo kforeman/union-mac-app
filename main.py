@@ -336,35 +336,14 @@ def _task_name(run: Run) -> str:
         return ""
 
 
-_PHASE_GLYPH = {
-    "SUCCEEDED": "✓",
-    "FAILED": "✗",
-    "ABORTED": "⊘",
-    "TIMED_OUT": "⏱",
-    "RUNNING": "→",
-    "INITIALIZING": "→",
-    "QUEUED": "·",
-    "WAITING_FOR_RESOURCES": "·",
-}
+@dataclass
+class ActionLite:
+    """Lightweight view of a Flyte v2 Action — only the fields we render."""
 
-
-def _format_action_summary(actions: list) -> Optional[str]:
-    if not actions:
-        return None
-    lines = ["Recent tasks:"]
-    for a in actions:
-        glyph = _PHASE_GLYPH.get(a.phase.name, "•")
-        task = (getattr(a, "task_name", None) or a.name or "")[:60]
-        when = (
-            _humanize_age(a.start_time)
-            if getattr(a, "start_time", None)
-            else ""
-        )
-        bits = [glyph, task]
-        if when:
-            bits.append(f"({when})")
-        lines.append(" ".join(bits))
-    return "\n".join(lines)
+    name: str
+    task_name: str
+    phase: ActionPhase
+    start_time: Optional[datetime]
 
 
 def _humanize_age(dt: Optional[datetime]) -> str:
@@ -426,8 +405,8 @@ class UnionStatusApp(rumps.App):
         self.runs: list[RunRow] = []
         self.available_pairs: list[tuple[str, str]] = []
         self.last_activity: dict[tuple[str, str], datetime] = {}
-        # Per-run task summary, keyed by (project, domain, run_name).
-        self.summary_cache: dict[tuple[str, str, str], str] = {}
+        # Per-run recent-task summary, keyed by (project, domain, run_name).
+        self.summary_cache: dict[tuple[str, str, str], list[ActionLite]] = {}
         filters, window = _load_config()
         self.filters: set[tuple[str, str]] = set(filters)
         self.window_label: str = window
@@ -646,9 +625,9 @@ class UnionStatusApp(rumps.App):
         if not to_fetch:
             return
 
-        def _summary_of(row: RunRow) -> tuple[RunRow, Optional[str]]:
+        def _summary_of(row: RunRow) -> tuple[RunRow, Optional[list[ActionLite]]]:
             try:
-                actions: list = []
+                actions: list[ActionLite] = []
                 for i, a in enumerate(
                     Action.listall(
                         for_run_name=row.name,
@@ -657,12 +636,19 @@ class UnionStatusApp(rumps.App):
                 ):
                     if i >= SUMMARY_ACTIONS:
                         break
-                    actions.append(a)
-                return row, _format_action_summary(actions)
+                    actions.append(
+                        ActionLite(
+                            name=a.name,
+                            task_name=getattr(a, "task_name", None) or a.name,
+                            phase=a.phase,
+                            start_time=getattr(a, "start_time", None),
+                        )
+                    )
+                return row, actions or None
             except Exception:
                 return row, None
 
-        new: dict[tuple[str, str, str], str] = {}
+        new: dict[tuple[str, str, str], list[ActionLite]] = {}
         with ThreadPoolExecutor(max_workers=8) as pool:
             for row, summary in pool.map(_summary_of, to_fetch):
                 if summary:
@@ -792,11 +778,15 @@ class UnionStatusApp(rumps.App):
                 _build_group_title(task, recent_phases)
             )
 
-            # Expandable submenu with each run in the group (capped).
+            # Each run is its own hover-expandable submenu listing the most
+            # recent tasks inside that run (mirrors the Projects/Time window
+            # styling, with an arrow indicator).
             for r in rs[:SUBMENU_RUN_CAP]:
                 sub_plain = (
                     f"{DOT_CHAR}  {r.name}  {_humanize_age(r.last_activity())}"
                 )
+                # Clicking the run row opens its Union page (same behavior as
+                # the top-level group row); hovering reveals the task list.
                 sub_item = rumps.MenuItem(
                     sub_plain, callback=self._make_opener(r.url)
                 )
@@ -807,9 +797,34 @@ class UnionStatusApp(rumps.App):
                 sub_attr.appendAttributedString_(
                     _attr(f"{r.name}  {_humanize_age(r.last_activity())}")
                 )
-                summary = self.summary_cache.get((r.project, r.domain, r.name))
-                if summary:
-                    sub_item._menuitem.setToolTip_(summary)
+                sub_item._menuitem.setAttributedTitle_(sub_attr)
+
+                actions = self.summary_cache.get((r.project, r.domain, r.name))
+                if actions:
+                    for a in actions:
+                        when = (
+                            _humanize_age(a.start_time) if a.start_time else ""
+                        )
+                        task_plain = f"{DOT_CHAR}  {a.task_name}   {when}"
+                        task_url = f"{r.url}?i={a.name}"
+                        task_item = rumps.MenuItem(
+                            task_plain, callback=self._make_opener(task_url)
+                        )
+                        task_attr = NSMutableAttributedString.alloc().init()
+                        task_attr.appendAttributedString_(
+                            _attr(
+                                DOT_CHAR + "  ",
+                                color=PHASE_COLOR.get(a.phase),
+                            )
+                        )
+                        suffix = f"  {when}" if when else ""
+                        task_attr.appendAttributedString_(
+                            _attr(f"{a.task_name}{suffix}")
+                        )
+                        task_item._menuitem.setAttributedTitle_(task_attr)
+                        sub_item.add(task_item)
+                else:
+                    sub_item.add(rumps.MenuItem("Loading task list…"))
                 sub_item._menuitem.setAttributedTitle_(sub_attr)
                 group_item.add(sub_item)
 
