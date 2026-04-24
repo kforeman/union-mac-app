@@ -131,3 +131,7 @@ A few knobs live at the top of [main.py](main.py):
 - `TOTAL_SHOWN` — max task groups displayed in the menu
 - `DOT_STRIP_MAX` — max dots per group row
 - `TIME_WINDOWS` / `DEFAULT_WINDOW_LABEL` — edit the time-window submenu
+
+## License
+
+MIT — see [LICENSE](LICENSE).

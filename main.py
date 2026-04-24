@@ -29,6 +29,10 @@ from AppKit import (
     NSFont,
     NSForegroundColorAttributeName,
     NSImage,
+    NSMutableParagraphStyle,
+    NSParagraphStyleAttributeName,
+    NSRightTextAlignment,
+    NSTextTab,
 )
 from Foundation import (
     NSAffineTransform,
@@ -116,15 +120,48 @@ def _attr(text: str, color=None, font=None) -> NSAttributedString:
     return NSAttributedString.alloc().initWithString_attributes_(text, attrs)
 
 
+# Right-aligned tab stop for the per-group label. Wide enough to comfortably
+# fit task name + 10 dots in the menu.
+GROUP_RIGHT_TAB_LOCATION = 320.0
+
+
+def _right_aligned_para_style() -> NSMutableParagraphStyle:
+    para = NSMutableParagraphStyle.alloc().init()
+    tab = NSTextTab.alloc().initWithTextAlignment_location_options_(
+        NSRightTextAlignment, GROUP_RIGHT_TAB_LOCATION, {}
+    )
+    para.setTabStops_([tab])
+    return para
+
+
 def _build_group_title(task: str, phases: list[ActionPhase]) -> NSAttributedString:
-    """Render `{task}   ●●●…` with the dots in their phase colors."""
+    """Render `{task}\\t●●●…` with dots in their phase colors, right-aligned."""
+    para = _right_aligned_para_style()
     out = NSMutableAttributedString.alloc().init()
-    out.appendAttributedString_(_attr(f"{task}   "))
+    out.appendAttributedString_(
+        NSAttributedString.alloc().initWithString_attributes_(
+            f"{task}\t", {NSParagraphStyleAttributeName: para}
+        )
+    )
     dot_font = NSFont.menuFontOfSize_(0)
-    for p in phases:
+    for i, p in enumerate(phases):
         color = PHASE_COLOR.get(p)
-        out.appendAttributedString_(_attr(DOT_CHAR, color=color, font=dot_font))
-        out.appendAttributedString_(_attr(" "))
+        attrs = {
+            NSParagraphStyleAttributeName: para,
+            NSForegroundColorAttributeName: color or NSColor.labelColor(),
+            "NSFont": dot_font,
+        }
+        out.appendAttributedString_(
+            NSAttributedString.alloc().initWithString_attributes_(
+                DOT_CHAR, attrs
+            )
+        )
+        if i < len(phases) - 1:
+            out.appendAttributedString_(
+                NSAttributedString.alloc().initWithString_attributes_(
+                    " ", {NSParagraphStyleAttributeName: para}
+                )
+            )
     return out
 
 
