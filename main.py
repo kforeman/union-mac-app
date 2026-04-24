@@ -424,9 +424,6 @@ class UnionStatusApp(rumps.App):
         self.last_activity: dict[tuple[str, str], datetime] = {}
         # Per-run task summary, keyed by (project, domain, run_name).
         self.summary_cache: dict[tuple[str, str, str], str] = {}
-        filters, window = _load_config()
-        self.filters: set[tuple[str, str]] = set(filters)
-
         self.window_label: str = window
         self.error: Optional[str] = None
         self.last_refresh: Optional[datetime] = None
