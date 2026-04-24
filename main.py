@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+import asyncio
 import re
 
 import flyte
@@ -41,7 +42,7 @@ from Foundation import (
     NSSize,
 )
 from flyte.models import ActionPhase
-from flyte.remote import App, Project, Run
+from flyte.remote import Action, App, Project, Run
 
 
 REFRESH_SECONDS = 60
@@ -379,13 +380,13 @@ def _load_config() -> tuple[Optional[str], Optional[str], str]:
     union CLI's `task.project`/`task.domain`. If the user never picks one
     from the menu, both are None and we fall back to the union config.
     """
-    labels = {label for label, _ in TIME_WINDOWS}
+    window_labels = {label for label, _ in TIME_WINDOWS}
     try:
         data = json.loads(CONFIG_PATH.read_text())
     except Exception:
         return None, None, DEFAULT_WINDOW_LABEL
     window = data.get("window")
-    if window not in labels:
+    if window not in window_labels:
         window = DEFAULT_WINDOW_LABEL
     return data.get("project"), data.get("domain"), window
 
@@ -652,27 +653,34 @@ class UnionStatusApp(rumps.App):
         if not to_fetch:
             return
 
-        def _summary_of(row: RunRow) -> tuple[RunRow, Optional[str]]:
+        async def _summary_of(row: RunRow) -> tuple[RunRow, Optional[str]]:
             try:
                 actions: list = []
-                for i, a in enumerate(
-                    Action.listall(
-                        for_run_name=row.name,
-                        sort_by=("created_at", "desc"),
-                    )
+                i = 0
+                async for a in Action.listall.aio(
+                    for_run_name=row.name,
+                    sort_by=("created_at", "desc"),
                 ):
                     if i >= SUMMARY_ACTIONS:
                         break
                     actions.append(a)
+                    i += 1
                 return row, _format_action_summary(actions)
             except Exception:
                 return row, None
 
+        async def _fetch_all() -> list[tuple[RunRow, Optional[str]]]:
+            return await asyncio.gather(*(_summary_of(r) for r in to_fetch))
+
+        # Run the fan-out on a fresh loop. We're in a worker thread here (the
+        # rumps/Cocoa main thread has its own event loop that we mustn't touch),
+        # so asyncio.run is safe: it creates + tears down its own loop.
+        results = asyncio.run(_fetch_all())
+
         new: dict[tuple[str, str, str], str] = {}
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for row, summary in pool.map(_summary_of, to_fetch):
-                if summary:
-                    new[(row.project, row.domain, row.name)] = summary
+        for row, summary in results:
+            if summary:
+                new[(row.project, row.domain, row.name)] = summary
 
         if not new:
             return
