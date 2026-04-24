@@ -8,7 +8,10 @@
 
 set -euo pipefail
 
-REPO="git+https://github.com/kforeman/union-mac-app"
+# Override for testing from a fork/branch, e.g.
+#   UNION_STATUS_REPO="git+https://github.com/you/union-mac-app@my-branch" \
+#     bash -c "$(curl -fsSL https://raw.githubusercontent.com/you/union-mac-app/my-branch/install.sh)"
+REPO="${UNION_STATUS_REPO:-git+https://github.com/kforeman/union-mac-app}"
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "uv is required. Install it first:" >&2
@@ -64,6 +67,8 @@ Installed.
   logs:    $LOG_DIR/union-status.log
 
 The Union menu bar icon should appear within a few seconds. Re-run this
-command to upgrade; uninstall with:
-  launchctl unload "$PLIST" && rm "$PLIST" && uv tool uninstall union-status
+command to upgrade.
+
+To uninstall:
+  launchctl unload "$PLIST" 2>/dev/null; rm -f "$PLIST"; uv tool uninstall union-status
 EOF

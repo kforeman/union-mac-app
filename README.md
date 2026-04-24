@@ -116,13 +116,29 @@ launchctl load -w $PLIST
 
 # Tail logs
 tail -f ~/Library/Logs/union-status.log
-
-# Uninstall
-launchctl unload $PLIST && rm $PLIST && uv tool uninstall union-status
 ```
 
-After upgrading (re-running the installer) launchd is reloaded automatically,
-so the new build takes over within a few seconds.
+Re-running the installer automatically unloads/reloads launchd, so upgrades
+take effect within a few seconds.
+
+## Uninstall
+
+```bash
+LABEL=com.$(whoami).union-status
+launchctl unload ~/Library/LaunchAgents/$LABEL.plist 2>/dev/null || true
+rm -f ~/Library/LaunchAgents/$LABEL.plist
+uv tool uninstall union-status
+```
+
+That removes the launchd agent, the plist, and the `union-status` binary.
+Also optional — your persisted preferences (window choice, picked project):
+
+```bash
+rm -rf ~/.config/union-status
+```
+
+The app never touches `~/.union/config.yaml`, so your Union CLI auth stays
+put.
 
 ## Tunables
 
