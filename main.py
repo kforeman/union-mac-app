@@ -8,6 +8,7 @@ it in the Union v2 console.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import webbrowser
 from dataclasses import dataclass
@@ -501,6 +502,11 @@ class UnionStatusApp(rumps.App):
         self._refresh_timer.start()
         self._render_timer = rumps.Timer(self._on_render_tick, 0.5)
         self._render_timer.start()
+        # Self-heal when the NSStatusItem gets orphaned from the menu bar
+        # on macOS Sequoia. Exiting lets launchd's KeepAlive respawn us
+        # with a fresh status item.
+        self._visibility_timer = rumps.Timer(self._on_visibility_check, 30)
+        self._visibility_timer.start()
 
     # ---------- callbacks ----------
 
@@ -517,6 +523,25 @@ class UnionStatusApp(rumps.App):
     def _on_refresh_click(self, _sender) -> None:
         self.title = "⏳ Union"
         self._kick_refresh()
+
+    def _on_visibility_check(self, _sender) -> None:
+        # When the menu bar / SystemUIServer is recreated mid-session,
+        # rumps' NSStatusItem gets disconnected and the icon silently
+        # vanishes. Detect that and exit so launchd respawns us.
+        try:
+            delegate = NSApplication.sharedApplication().delegate()
+            nsitem = getattr(delegate, "nsstatusitem", None)
+            if nsitem is None:
+                return
+            button = nsitem.button() if hasattr(nsitem, "button") else None
+            if button is None or button.window() is None:
+                print(
+                    "status item lost, exiting for launchd to respawn",
+                    flush=True,
+                )
+                os._exit(1)
+        except Exception:
+            pass
 
     def _on_open_ui(self, _sender) -> None:
         if not self.host:
