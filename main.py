@@ -97,18 +97,36 @@ PHASE_COLOR = {
 }
 
 
-def _attr(text: str, color=None, font=None) -> NSAttributedString:
+def _attr(text: str, color=None, font=None, para=None) -> NSAttributedString:
     attrs: dict = {}
     if color is not None:
         attrs[NSForegroundColorAttributeName] = color
     if font is not None:
         attrs["NSFont"] = font
+    if para is not None:
+        attrs[NSParagraphStyleAttributeName] = para
     return NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+
+
+def _right_tab_para(location: float) -> NSMutableParagraphStyle:
+    para = NSMutableParagraphStyle.alloc().init()
+    tab = NSTextTab.alloc().initWithTextAlignment_location_options_(
+        NSRightTextAlignment, location, {}
+    )
+    para.setTabStops_([tab])
+    return para
 
 
 # Right-aligned tab stop for the per-group label. Wide enough to comfortably
 # fit task name + 10 dots in the menu.
 GROUP_RIGHT_TAB_LOCATION = 320.0
+
+# Right-aligned tab stops used to push the gray "<verb> <age>" suffix to the
+# right edge of each menu item. Picked to comfortably fit typical run/task
+# names without forcing the menu wider than necessary.
+RUN_MENU_TAB = 360.0
+TASK_MENU_TAB = 360.0
+APP_MENU_TAB = 240.0
 
 
 def _right_aligned_para_style() -> NSMutableParagraphStyle:
@@ -302,6 +320,31 @@ class AppRow:
     name: str
     endpoint: str
     console_url: str
+    last_deployed: Optional[datetime] = None
+
+
+def _pb_timestamp_to_datetime(ts) -> Optional[datetime]:
+    seconds = getattr(ts, "seconds", 0) or 0
+    nanos = getattr(ts, "nanos", 0) or 0
+    if seconds == 0 and nanos == 0:
+        return None
+    return datetime.fromtimestamp(seconds + nanos / 1e9, tz=timezone.utc)
+
+
+# DeploymentStatus enum values that represent steady-state operation rather
+# than a deploy event. Anything else (PENDING/DEPLOYING/ASSIGNED/etc.) marks
+# a fresh rollout. Hardcoded to avoid pulling another flyteidl import.
+_APP_NON_DEPLOY_STATUSES = {7, 8, 9}  # ACTIVE, SCALING_UP, SCALING_DOWN
+
+
+def _app_last_deploy_time(status) -> Optional[datetime]:
+    conditions = list(status.conditions)
+    for c in reversed(conditions):
+        if c.deployment_status not in _APP_NON_DEPLOY_STATUSES:
+            return _pb_timestamp_to_datetime(c.last_transition_time)
+    if conditions:
+        return _pb_timestamp_to_datetime(conditions[-1].last_transition_time)
+    return None
 
 
 def _parse_ts(value: Optional[str]) -> Optional[datetime]:
@@ -337,6 +380,34 @@ class ActionLite:
     task_name: str
     phase: ActionPhase
     start_time: Optional[datetime]
+    end_time: Optional[datetime] = None
+
+
+# Phase → (verb, use_end_time) for the gray "<verb> X ago" suffix on tasks.
+_PHASE_LABEL: dict[ActionPhase, tuple[str, bool]] = {
+    ActionPhase.QUEUED: ("queued", False),
+    ActionPhase.WAITING_FOR_RESOURCES: ("waiting", False),
+    ActionPhase.INITIALIZING: ("initializing", False),
+    ActionPhase.RUNNING: ("started", False),
+    ActionPhase.SUCCEEDED: ("succeeded", True),
+    ActionPhase.FAILED: ("failed", True),
+    ActionPhase.ABORTED: ("aborted", True),
+    ActionPhase.TIMED_OUT: ("timed out", True),
+}
+
+
+def _phase_status_suffix(
+    phase: ActionPhase,
+    started: Optional[datetime],
+    ended: Optional[datetime],
+) -> str:
+    label = _PHASE_LABEL.get(phase)
+    if label is None:
+        return ""
+    verb, use_end = label
+    when = ended if use_end else started
+    age = _humanize_age(when)
+    return f"{verb} {age}" if age else verb
 
 
 def _humanize_age(dt: Optional[datetime]) -> str:
@@ -577,6 +648,7 @@ class UnionStatusApp(rumps.App):
             for a in App.listall(limit=200):
                 if not a.is_active():
                     continue
+                last_deployed = _app_last_deploy_time(a.pb2.status)
                 apps.append(
                     AppRow(
                         project=a.pb2.metadata.id.project,
@@ -584,6 +656,7 @@ class UnionStatusApp(rumps.App):
                         name=a.name,
                         endpoint=a.endpoint,
                         console_url=a.url,
+                        last_deployed=last_deployed,
                     )
                 )
 
@@ -644,12 +717,21 @@ class UnionStatusApp(rumps.App):
                 ):
                     if i >= SUMMARY_ACTIONS:
                         break
+                    end_time = None
+                    try:
+                        if a.pb2.status.HasField("end_time"):
+                            end_time = a.pb2.status.end_time.ToDatetime().replace(
+                                tzinfo=timezone.utc
+                            )
+                    except Exception:
+                        pass
                     actions.append(
                         ActionLite(
                             name=a.name,
                             task_name=getattr(a, "task_name", None) or a.name,
                             phase=a.phase,
                             start_time=getattr(a, "start_time", None),
+                            end_time=end_time,
                         )
                     )
                     i += 1
@@ -809,30 +891,41 @@ class UnionStatusApp(rumps.App):
             # recent tasks inside that run (mirrors the Projects/Time window
             # styling, with an arrow indicator).
             for r in rs[:SUBMENU_RUN_CAP]:
-                sub_plain = (
-                    f"{DOT_CHAR}  {r.name}  {_humanize_age(r.last_activity())}"
-                )
+                run_suffix = _phase_status_suffix(r.phase, r.started, r.ended)
+                sub_plain = f"{DOT_CHAR}  {r.name}   {run_suffix}"
                 # Clicking the run row opens its Union page (same behavior as
                 # the top-level group row); hovering reveals the task list.
                 sub_item = rumps.MenuItem(
                     sub_plain, callback=self._make_opener(r.url)
                 )
+                run_para = _right_tab_para(RUN_MENU_TAB)
                 sub_attr = NSMutableAttributedString.alloc().init()
                 sub_attr.appendAttributedString_(
-                    _attr(DOT_CHAR + "  ", color=PHASE_COLOR.get(r.phase))
+                    _attr(
+                        DOT_CHAR + "  ",
+                        color=PHASE_COLOR.get(r.phase),
+                        para=run_para,
+                    )
                 )
-                sub_attr.appendAttributedString_(
-                    _attr(f"{r.name}  {_humanize_age(r.last_activity())}")
-                )
+                sub_attr.appendAttributedString_(_attr(r.name, para=run_para))
+                if run_suffix:
+                    sub_attr.appendAttributedString_(
+                        _attr(
+                            f"\t{run_suffix}",
+                            color=NSColor.secondaryLabelColor(),
+                            para=run_para,
+                        )
+                    )
                 sub_item._menuitem.setAttributedTitle_(sub_attr)
 
                 actions = self.summary_cache.get((r.project, r.domain, r.name))
                 if actions:
+                    task_para = _right_tab_para(TASK_MENU_TAB)
                     for a in actions:
-                        when = (
-                            _humanize_age(a.start_time) if a.start_time else ""
+                        status_suffix = _phase_status_suffix(
+                            a.phase, a.start_time, a.end_time
                         )
-                        task_plain = f"{DOT_CHAR}  {a.task_name}   {when}"
+                        task_plain = f"{DOT_CHAR}  {a.task_name}   {status_suffix}"
                         task_url = f"{r.url}?i={a.name}"
                         task_item = rumps.MenuItem(
                             task_plain, callback=self._make_opener(task_url)
@@ -842,12 +935,20 @@ class UnionStatusApp(rumps.App):
                             _attr(
                                 DOT_CHAR + "  ",
                                 color=PHASE_COLOR.get(a.phase),
+                                para=task_para,
                             )
                         )
-                        suffix = f"  {when}" if when else ""
                         task_attr.appendAttributedString_(
-                            _attr(f"{a.task_name}{suffix}")
+                            _attr(a.task_name, para=task_para)
                         )
+                        if status_suffix:
+                            task_attr.appendAttributedString_(
+                                _attr(
+                                    f"\t{status_suffix}",
+                                    color=NSColor.secondaryLabelColor(),
+                                    para=task_para,
+                                )
+                            )
                         task_item._menuitem.setAttributedTitle_(task_attr)
                         sub_item.add(task_item)
                 else:
@@ -870,11 +971,27 @@ class UnionStatusApp(rumps.App):
         attr.appendAttributedString_(_attr(a.name))
         item._menuitem.setAttributedTitle_(attr)
         if a.endpoint:
-            item.add(
-                rumps.MenuItem(
-                    "Open app", callback=self._make_opener(a.endpoint)
-                )
+            deploy_age = _humanize_age(a.last_deployed)
+            suffix = f"deployed {deploy_age}" if deploy_age else ""
+            plain_label = (
+                f"Open app    {suffix}" if suffix else "Open app"
             )
+            open_item = rumps.MenuItem(
+                plain_label, callback=self._make_opener(a.endpoint)
+            )
+            if suffix:
+                para = _right_tab_para(APP_MENU_TAB)
+                open_attr = NSMutableAttributedString.alloc().init()
+                open_attr.appendAttributedString_(_attr("Open app", para=para))
+                open_attr.appendAttributedString_(
+                    _attr(
+                        f"\t{suffix}",
+                        color=NSColor.secondaryLabelColor(),
+                        para=para,
+                    )
+                )
+                open_item._menuitem.setAttributedTitle_(open_attr)
+            item.add(open_item)
         if a.console_url:
             item.add(
                 rumps.MenuItem(
