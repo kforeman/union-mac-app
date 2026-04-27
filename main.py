@@ -25,12 +25,15 @@ from AppKit import (
     NSApplication,
     NSBezierPath,
     NSColor,
+    NSCompositingOperationSourceAtop,
     NSCompositingOperationSourceOver,
     NSFont,
     NSForegroundColorAttributeName,
     NSImage,
+    NSImageSymbolConfiguration,
     NSMutableParagraphStyle,
     NSParagraphStyleAttributeName,
+    NSRectFillUsingOperation,
     NSRightTextAlignment,
     NSTextTab,
 )
@@ -238,12 +241,53 @@ def _bezier_from_svg(d: str) -> NSBezierPath:
     return path
 
 
-def build_union_icon(height_pt: float = 20.0, phase_color=None) -> NSImage:
+def _tinted_sf_symbol(name: str, point_size: float, color) -> Optional[NSImage]:
+    """SF Symbol rendered at `point_size` and tinted with `color`. Returns
+    None if the symbol isn't available on this macOS version."""
+    base = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+        name, None
+    )
+    if base is None:
+        return None
+    config = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+        point_size, 0
+    )
+    configured = base.imageWithSymbolConfiguration_(config) or base
+    sym_size = configured.size()
+    out = NSImage.alloc().initWithSize_(sym_size)
+    out.lockFocus()
+    try:
+        rect = NSMakeRect(0, 0, sym_size.width, sym_size.height)
+        configured.drawInRect_fromRect_operation_fraction_(
+            rect, rect, NSCompositingOperationSourceOver, 1.0
+        )
+        # Tint: replace the symbol's color with `color` while preserving its
+        # alpha mask via SourceAtop.
+        (color or NSColor.labelColor()).set()
+        NSRectFillUsingOperation(rect, NSCompositingOperationSourceAtop)
+    finally:
+        out.unlockFocus()
+    return out
+
+
+def build_union_icon(
+    height_pt: float = 20.0,
+    *,
+    phase_color=None,
+    overlay_symbol: Optional[str] = None,
+    overlay_color=None,
+) -> NSImage:
     """Render the Union logo as an NSImage sized for the menu bar, with an
-    optional flat colored dot overlaid in the bottom-right corner."""
+    optional overlay in the bottom-right corner.
+
+    - `phase_color`: draw a flat colored phase dot.
+    - `overlay_symbol`: draw an SF Symbol (e.g. "exclamationmark.triangle.fill"
+      or "hourglass") instead, tinted with `overlay_color`. Takes precedence
+      over `phase_color` when both are given.
+    """
     vb_w, vb_h = UNION_VIEWBOX
     # The actual glyph sits inside the viewbox with padding; use the viewbox
-    # so the dot has a natural corner to sit in.
+    # so the overlay has a natural corner to sit in.
     aspect = vb_w / vb_h
     size = NSSize(height_pt * aspect, height_pt)
 
@@ -270,7 +314,29 @@ def build_union_icon(height_pt: float = 20.0, phase_color=None) -> NSImage:
             p.transformUsingAffineTransform_(tx)
             p.fill()
 
-        if phase_color is not None:
+        if overlay_symbol is not None:
+            sym = _tinted_sf_symbol(
+                overlay_symbol,
+                height_pt * 0.6,
+                overlay_color or NSColor.labelColor(),
+            )
+            if sym is not None:
+                sym_size = sym.size()
+                pad = 1.0
+                halo_w = sym_size.width + pad
+                halo_h = sym_size.height + pad
+                halo_rect = NSMakeRect(
+                    size.width - halo_w, -pad / 2, halo_w, halo_h
+                )
+                NSColor.windowBackgroundColor().set()
+                NSBezierPath.bezierPathWithOvalInRect_(halo_rect).fill()
+                sym.drawAtPoint_fromRect_operation_fraction_(
+                    (size.width - sym_size.width, 0),
+                    NSMakeRect(0, 0, sym_size.width, sym_size.height),
+                    NSCompositingOperationSourceOver,
+                    1.0,
+                )
+        elif phase_color is not None:
             # Small colored dot in the bottom-right corner. A 1pt halo in the
             # menu bar's background colour separates it from the logo stroke.
             dot_d = height_pt * 0.5
@@ -461,7 +527,9 @@ def _window_hours(label: str) -> Optional[float]:
 
 class UnionStatusApp(rumps.App):
     def __init__(self) -> None:
-        super().__init__("Union", title="⚪ Union", quit_button=None)
+        # rumps requires *something* as the initial title so the status item
+        # exists; the loading hourglass replaces it on the next event-loop tick.
+        super().__init__("Union", title="⏳", quit_button=None)
         self.host: str = ""
         # Scope: if the user has picked one via the Projects menu, that is
         # persisted in config.json and overrides ~/.union/config.yaml. If
@@ -495,6 +563,7 @@ class UnionStatusApp(rumps.App):
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
         self._build_window_menu()
+        self._set_status_title(loading=True)
 
         self._kick_refresh()
         self._refresh_timer = rumps.Timer(self._on_timer, REFRESH_SECONDS)
@@ -515,7 +584,7 @@ class UnionStatusApp(rumps.App):
             self._render()
 
     def _on_refresh_click(self, _sender) -> None:
-        self.title = "⏳ Union"
+        self._set_status_title(loading=True)
         self._kick_refresh()
 
     def _on_open_ui(self, _sender) -> None:
@@ -540,6 +609,15 @@ class UnionStatusApp(rumps.App):
         with self._lock:
             self._pending_render = True
 
+    def _on_reset_connection(self, _sender) -> None:
+        # Drop the cached gRPC client and force re-init on the next refresh.
+        # Useful when the channel has wedged on a network change but the
+        # 60s auto-tick hasn't recovered it yet.
+        with self._lock:
+            self._flyte_ready = False
+        self._set_status_title(loading=True)
+        self._kick_refresh()
+
     def _on_pick_project(self, sender) -> None:
         pair = getattr(sender, "_pair", None)
         if pair is None:
@@ -556,7 +634,7 @@ class UnionStatusApp(rumps.App):
             self._flyte_ready = False
             self.runs = []
             self.apps = []
-        self.title = "⏳ Union"
+        self._set_status_title(loading=True)
         self._kick_refresh()
 
     # ---------- refresh ----------
@@ -673,7 +751,12 @@ class UnionStatusApp(rumps.App):
             # runs are cached for the life of the process.
             self._refresh_run_summaries(rows)
         except Exception as exc:  # noqa: BLE001
+            # Force re-init on the next refresh: the gRPC channel may have
+            # wedged during a network blip (captive portal, sleep/wake,
+            # flaky in-flight WiFi) and reusing it keeps surfacing the same
+            # ConnectError even after connectivity returns.
             with self._lock:
+                self._flyte_ready = False
                 self.error = f"{type(exc).__name__}: {exc}"
                 self.last_refresh = datetime.now(timezone.utc)
                 self._pending_render = True
@@ -788,9 +871,15 @@ class UnionStatusApp(rumps.App):
             self.menu.insert_before("Project", None)
 
         if error:
-            self.title = "⚠️ Union"
+            self._set_status_title(error=True)
             self.menu.insert_before(
                 "Project", rumps.MenuItem(f"Error: {error[:100]}")
+            )
+            self.menu.insert_before(
+                "Project",
+                rumps.MenuItem(
+                    "Reset connection", callback=self._on_reset_connection
+                ),
             )
             self.menu.insert_before("Project", None)
             return
@@ -824,7 +913,7 @@ class UnionStatusApp(rumps.App):
             icon_phase = latest_finished.phase
         else:
             icon_phase = None
-        self._set_status_title(icon_phase, "Union")
+        self._set_status_title(icon_phase=icon_phase)
 
         if not runs:
             self.menu.insert_before(
@@ -1030,20 +1119,60 @@ class UnionStatusApp(rumps.App):
             item.state = 1 if pair == (self.project, self.domain) else 0
             self._projects_menu[label] = item
 
-    def _set_status_title(self, icon_phase, text: str) -> None:
-        # Clear the text title and show the Union logo with an overlay dot.
+    def _set_status_title(
+        self,
+        *,
+        icon_phase=None,
+        error: bool = False,
+        loading: bool = False,
+    ) -> None:
+        """Render the menu bar item as the Union logo with a state overlay.
+
+        States, in priority order: error (warning glyph), loading (hourglass),
+        phase (colored dot for the most recent run), idle (logo only). The
+        word "Union" never appears in the menu bar — state goes to the
+        tooltip so it's still discoverable on hover.
+        """
+        if error:
+            overlay_symbol = "exclamationmark.triangle.fill"
+            overlay_color = NSColor.systemOrangeColor()
+            tooltip = "Union — connection error"
+            fallback = "⚠️"
+        elif loading:
+            overlay_symbol = "hourglass"
+            overlay_color = NSColor.secondaryLabelColor()
+            tooltip = "Union — refreshing"
+            fallback = "⏳"
+        else:
+            overlay_symbol = None
+            overlay_color = None
+            tooltip = "Union"
+            fallback = DOT_CHAR if icon_phase is not None else "○"
+
+        # Suppress the phase dot whenever a state overlay is shown so the
+        # warning/hourglass isn't fighting a colored dot for the same corner.
+        phase_color = (
+            PHASE_COLOR.get(icon_phase)
+            if icon_phase is not None and overlay_symbol is None
+            else None
+        )
+
         self.title = ""
         try:
             delegate = NSApplication.sharedApplication().delegate()
             nsitem = delegate.nsstatusitem
-            color = PHASE_COLOR.get(icon_phase) if icon_phase is not None else None
-            img = build_union_icon(height_pt=18.0, phase_color=color)
+            img = build_union_icon(
+                height_pt=18.0,
+                phase_color=phase_color,
+                overlay_symbol=overlay_symbol,
+                overlay_color=overlay_color,
+            )
             nsitem.setImage_(img)
             nsitem.setTitle_("")
-            nsitem.setToolTip_(text)
+            nsitem.setToolTip_(tooltip)
         except Exception:
-            # Fall back to a text-only title so we at least see *something*.
-            self.title = f"{DOT_CHAR if icon_phase else '○'} {text}"
+            # Fall back to a glyph-only title; never include the word "Union".
+            self.title = fallback
 
     def _make_opener(self, url: str):
         def _cb(_sender):
