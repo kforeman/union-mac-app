@@ -387,6 +387,8 @@ class AppRow:
     endpoint: str
     console_url: str
     last_deployed: Optional[datetime] = None
+    current_replicas: int = 0
+    max_replicas: int = 0
 
 
 def _pb_timestamp_to_datetime(ts) -> Optional[datetime]:
@@ -735,6 +737,8 @@ class UnionStatusApp(rumps.App):
                         endpoint=a.endpoint,
                         console_url=a.url,
                         last_deployed=last_deployed,
+                        current_replicas=a.pb2.status.current_replicas,
+                        max_replicas=a.pb2.spec.autoscaling.replicas.max,
                     )
                 )
 
@@ -1051,13 +1055,18 @@ class UnionStatusApp(rumps.App):
         # Primary click opens the exposed endpoint; the submenu lists both
         # the live app URL and the Union console page so either is one click
         # away when the row is hovered.
-        plain = f"{DOT_CHAR}  {a.name}"
+        replicas = f" ({a.current_replicas}/{a.max_replicas})" if a.max_replicas else ""
+        plain = f"{DOT_CHAR}  {a.name}{replicas}"
         item = rumps.MenuItem(plain, callback=self._make_opener(a.endpoint))
         attr = NSMutableAttributedString.alloc().init()
         attr.appendAttributedString_(
             _attr(DOT_CHAR + "  ", color=PHASE_COLOR.get(ActionPhase.RUNNING))
         )
         attr.appendAttributedString_(_attr(a.name))
+        if replicas:
+            attr.appendAttributedString_(
+                _attr(replicas, color=NSColor.secondaryLabelColor())
+            )
         item._menuitem.setAttributedTitle_(attr)
         if a.endpoint:
             deploy_age = _humanize_age(a.last_deployed)
