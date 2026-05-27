@@ -527,6 +527,81 @@ def _window_hours(label: str) -> Optional[float]:
     return None
 
 
+def _menu_names(items: list[str], current: Optional[str]) -> list[str]:
+    """Sorted unique names, with `current` forced in so the radio state survives
+    a stale or empty cluster listing."""
+    extras = {current} if current else set()
+    return sorted(set(items) | extras)
+
+
+def _project_pairs(projects) -> list[tuple[str, str]]:
+    """Flatten a Project iterable into sorted (project, domain) pairs. The
+    `development` default mirrors what Union's UI assumes for projects that
+    don't advertise any domain in the API response."""
+    out: list[tuple[str, str]] = []
+    for p in projects:
+        pdata = p.to_dict()
+        pid = pdata.get("id") or pdata.get("name")
+        domains = pdata.get("domains") or [{"id": "development"}]
+        for d in domains:
+            did = d.get("id") or d.get("name")
+            if pid and did:
+                out.append((pid, did))
+    out.sort()
+    return out
+
+
+def _run_row(run, project: str, domain: str) -> "RunRow":
+    started, ended = _parse_times(run)
+    return RunRow(
+        project=project,
+        domain=domain,
+        name=run.name,
+        phase=run.phase,
+        started=started,
+        ended=ended,
+        url=run.url,
+        task=_task_name(run),
+    )
+
+
+def _app_row(app) -> "AppRow":
+    return AppRow(
+        project=app.pb2.metadata.id.project,
+        domain=app.pb2.metadata.id.domain,
+        name=app.name,
+        endpoint=app.endpoint,
+        console_url=app.url,
+        last_deployed=_app_last_deploy_time(app.pb2.status),
+        current_replicas=app.pb2.status.current_replicas,
+        max_replicas=app.pb2.spec.autoscaling.replicas.max,
+    )
+
+
+def _group_runs(runs: list["RunRow"]) -> list[tuple[str, list["RunRow"]]]:
+    """Group by (project, domain, task) and order: groups by most-recent activity,
+    and runs within each group the same way. Returns (task_label, runs) pairs;
+    the project/domain dimensions of the key are only there to keep groups from
+    bleeding into each other if the caller ever mixes scopes."""
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    groups: dict[tuple[str, str, str], list["RunRow"]] = {}
+    for r in runs:
+        key = (r.project, r.domain, r.task or r.name)
+        groups.setdefault(key, []).append(r)
+
+    def _latest(rs: list["RunRow"]) -> datetime:
+        return max((r.last_activity() or epoch) for r in rs)
+
+    ordered = sorted(groups.items(), key=lambda kv: _latest(kv[1]), reverse=True)
+    out: list[tuple[str, list["RunRow"]]] = []
+    for (_proj, _dom, task), rs in ordered:
+        out.append((
+            task,
+            sorted(rs, key=lambda r: r.last_activity() or epoch, reverse=True),
+        ))
+    return out
+
+
 class UnionStatusApp(rumps.App):
     def __init__(self) -> None:
         # rumps requires *something* as the initial title so the status item
@@ -676,19 +751,10 @@ class UnionStatusApp(rumps.App):
 
             # Cluster-wide project list, for the Project picker. Cheap; one
             # paginated call. Failures here shouldn't block runs/apps.
-            available: list[tuple[str, str]] = []
             try:
-                for p in Project.listall():
-                    pdata = p.to_dict()
-                    pid = pdata.get("id") or pdata.get("name")
-                    domains = pdata.get("domains") or [{"id": "development"}]
-                    for d in domains:
-                        did = d.get("id") or d.get("name")
-                        if pid and did:
-                            available.append((pid, did))
-                available.sort()
+                available = _project_pairs(Project.listall())
             except Exception:
-                pass
+                available = []
 
             if not self.project or not self.domain:
                 with self._lock:
@@ -706,25 +772,13 @@ class UnionStatusApp(rumps.App):
                     self._pending_render = True
                 return
 
-            rows: list[RunRow] = []
-            for r in Run.listall(
-                limit=RECENT_LIMIT_PER_DOMAIN,
-                sort_by=("created_at", "desc"),
-            ):
-                started, ended = _parse_times(r)
-                rows.append(
-                    RunRow(
-                        project=self.project,
-                        domain=self.domain,
-                        name=r.name,
-                        phase=r.phase,
-                        started=started,
-                        ended=ended,
-                        url=r.url,
-                        task=_task_name(r),
-                    )
+            rows = [
+                _run_row(r, self.project, self.domain)
+                for r in Run.listall(
+                    limit=RECENT_LIMIT_PER_DOMAIN,
+                    sort_by=("created_at", "desc"),
                 )
-
+            ]
             rows.sort(
                 key=lambda x: x.started or datetime.min.replace(tzinfo=timezone.utc),
                 reverse=True,
@@ -733,23 +787,7 @@ class UnionStatusApp(rumps.App):
             # Active apps in the current project/domain. App.listall is already
             # scoped by the init'd cfg.project/cfg.domain, so no extra filter
             # is needed.
-            apps: list[AppRow] = []
-            for a in App.listall(limit=200):
-                if not a.is_active():
-                    continue
-                last_deployed = _app_last_deploy_time(a.pb2.status)
-                apps.append(
-                    AppRow(
-                        project=a.pb2.metadata.id.project,
-                        domain=a.pb2.metadata.id.domain,
-                        name=a.name,
-                        endpoint=a.endpoint,
-                        console_url=a.url,
-                        last_deployed=last_deployed,
-                        current_replicas=a.pb2.status.current_replicas,
-                        max_replicas=a.pb2.spec.autoscaling.replicas.max,
-                    )
-                )
+            apps = [_app_row(a) for a in App.listall(limit=200) if a.is_active()]
 
             with self._lock:
                 self.runs = rows
@@ -776,18 +814,8 @@ class UnionStatusApp(rumps.App):
 
     def _refresh_run_summaries(self, rows: list[RunRow]) -> None:
         # Mirror the menu's grouping/cap so we only fetch what the user can see.
-        groups: dict[tuple[str, str, str], list[RunRow]] = {}
-        for r in rows:
-            key = (r.project, r.domain, r.task or r.name)
-            groups.setdefault(key, []).append(r)
-
         visible: list[RunRow] = []
-        for rs in groups.values():
-            rs.sort(
-                key=lambda r: r.last_activity()
-                or datetime.min.replace(tzinfo=timezone.utc),
-                reverse=True,
-            )
+        for _task, rs in _group_runs(rows):
             visible.extend(rs[:SUBMENU_RUN_CAP])
 
         with self._lock:
@@ -963,26 +991,7 @@ class UnionStatusApp(rumps.App):
             )
 
     def _render_groups(self, runs: list[RunRow]) -> None:
-        # Group by task/function name (falls back to the run id if missing).
-        groups: dict[tuple[str, str, str], list[RunRow]] = {}
-        for r in runs:
-            key = (r.project, r.domain, r.task or r.name)
-            groups.setdefault(key, []).append(r)
-
-        def _latest(rs: list[RunRow]) -> datetime:
-            return max(
-                (r.last_activity() or datetime.min.replace(tzinfo=timezone.utc))
-                for r in rs
-            )
-
-        ordered = sorted(groups.items(), key=lambda kv: _latest(kv[1]), reverse=True)
-
-        for (project, domain, task), rs in ordered[:TOTAL_SHOWN]:
-            rs.sort(
-                key=lambda r: r.last_activity()
-                or datetime.min.replace(tzinfo=timezone.utc),
-                reverse=True,
-            )
+        for task, rs in _group_runs(runs)[:TOTAL_SHOWN]:
             latest = rs[0]
             # Dot strip: oldest → newest, left → right (so the tip is the
             # most recent run, matching the Union UI).
@@ -1128,11 +1137,7 @@ class UnionStatusApp(rumps.App):
     ) -> None:
         for key in list(self._projects_menu.keys()):
             del self._projects_menu[key]
-        # Include the current pick even if the cluster listing failed or
-        # hasn't returned yet, so the radio state is always correct.
-        names = sorted({p for p, _ in available} | (
-            {self.project} if self.project else set()
-        ))
+        names = _menu_names([p for p, _ in available], self.project)
         if not names:
             self._projects_menu["Loading…"] = rumps.MenuItem("Loading…")
             return
@@ -1147,9 +1152,7 @@ class UnionStatusApp(rumps.App):
     ) -> None:
         for key in list(self._envs_menu.keys()):
             del self._envs_menu[key]
-        names = sorted({d for _, d in available} | (
-            {self.domain} if self.domain else set()
-        ))
+        names = _menu_names([d for _, d in available], self.domain)
         if not names:
             self._envs_menu["Loading…"] = rumps.MenuItem("Loading…")
             return
