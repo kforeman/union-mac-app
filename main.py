@@ -553,11 +553,13 @@ class UnionStatusApp(rumps.App):
         self._flyte_ready = False
 
         self._projects_menu = rumps.MenuItem("Project")
+        self._envs_menu = rumps.MenuItem("Environment")
         self._window_menu = rumps.MenuItem("Time window")
         self.menu = [
             "Loading…",
             None,
             self._projects_menu,
+            self._envs_menu,
             self._window_menu,
             rumps.MenuItem("Refresh now", callback=self._on_refresh_click),
             rumps.MenuItem("Open Union UI", callback=self._on_open_ui),
@@ -621,14 +623,20 @@ class UnionStatusApp(rumps.App):
         self._kick_refresh()
 
     def _on_pick_project(self, sender) -> None:
-        pair = getattr(sender, "_pair", None)
-        if pair is None:
-            return
-        new_project, new_domain = pair
-        if new_project == self.project and new_domain == self.domain:
+        new_project = getattr(sender, "_project", None)
+        if not new_project or new_project == self.project:
             return
         self.project = new_project
+        self._apply_scope_change()
+
+    def _on_pick_env(self, sender) -> None:
+        new_domain = getattr(sender, "_domain", None)
+        if not new_domain or new_domain == self.domain:
+            return
         self.domain = new_domain
+        self._apply_scope_change()
+
+    def _apply_scope_change(self) -> None:
         _save_config(self.project, self.domain, self.window_label)
         # Force re-init on the next refresh (happens on the worker thread so
         # the UI stays responsive while auth/networking runs).
@@ -688,7 +696,8 @@ class UnionStatusApp(rumps.App):
                     self.apps = []
                     self.available_pairs = available
                     self.error = (
-                        "No project/domain configured — pick one under Project"
+                        "No project/domain configured — pick one under "
+                        "Project and Environment"
                         if available
                         else "No project/domain in ~/.union/config.yaml "
                         "(set task.project and task.domain)"
@@ -856,12 +865,20 @@ class UnionStatusApp(rumps.App):
             error = self.error
             last_refresh = self.last_refresh
 
-        static = {"Project", "Time window", "Refresh now", "Open Union UI", "Quit"}
+        static = {
+            "Project",
+            "Environment",
+            "Time window",
+            "Refresh now",
+            "Open Union UI",
+            "Quit",
+        }
         for key in list(self.menu.keys()):
             if key not in static:
                 del self.menu[key]
 
         self._build_projects_menu(available)
+        self._build_envs_menu(available)
 
         # Header (top of menu): which project/domain we're showing. Inserted
         # first so it ends up above everything else. insert_before places
@@ -1113,20 +1130,34 @@ class UnionStatusApp(rumps.App):
             del self._projects_menu[key]
         # Include the current pick even if the cluster listing failed or
         # hasn't returned yet, so the radio state is always correct.
-        pairs = sorted(set(available) | {
-            (self.project, self.domain) if self.project and self.domain else None
-        } - {None})
-        if not pairs:
-            placeholder = rumps.MenuItem("Loading…")
-            self._projects_menu["Loading…"] = placeholder
+        names = sorted({p for p, _ in available} | (
+            {self.project} if self.project else set()
+        ))
+        if not names:
+            self._projects_menu["Loading…"] = rumps.MenuItem("Loading…")
             return
-        for pair in pairs:
-            p, d = pair
-            label = f"{p}/{d}"
-            item = rumps.MenuItem(label, callback=self._on_pick_project)
-            item._pair = pair
-            item.state = 1 if pair == (self.project, self.domain) else 0
-            self._projects_menu[label] = item
+        for name in names:
+            item = rumps.MenuItem(name, callback=self._on_pick_project)
+            item._project = name
+            item.state = 1 if name == self.project else 0
+            self._projects_menu[name] = item
+
+    def _build_envs_menu(
+        self, available: list[tuple[str, str]]
+    ) -> None:
+        for key in list(self._envs_menu.keys()):
+            del self._envs_menu[key]
+        names = sorted({d for _, d in available} | (
+            {self.domain} if self.domain else set()
+        ))
+        if not names:
+            self._envs_menu["Loading…"] = rumps.MenuItem("Loading…")
+            return
+        for name in names:
+            item = rumps.MenuItem(name, callback=self._on_pick_env)
+            item._domain = name
+            item.state = 1 if name == self.domain else 0
+            self._envs_menu[name] = item
 
     def _set_status_title(
         self,
