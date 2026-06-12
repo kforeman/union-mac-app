@@ -391,6 +391,15 @@ class AppRow:
     max_replicas: int = 0
 
 
+@dataclass
+class ProjectActivity:
+    """Most-recent run for one (project, domain), reduced to what the project
+    picker's activity dot needs."""
+
+    phase: ActionPhase
+    last_activity: Optional[datetime] = None
+
+
 def _pb_timestamp_to_datetime(ts) -> Optional[datetime]:
     seconds = getattr(ts, "seconds", 0) or 0
     nanos = getattr(ts, "nanos", 0) or 0
@@ -527,6 +536,34 @@ def _window_hours(label: str) -> Optional[float]:
     return None
 
 
+def _project_dot_phase(
+    entries: list[ProjectActivity],
+    window_hours: Optional[float],
+    now: datetime,
+) -> Optional[ActionPhase]:
+    """Phase to color a project's activity dot, or None if idle in the window.
+
+    Picks the most recent activity across the project's domains. A non-terminal
+    (running/queued) run counts as active "now", so it dominates and always
+    falls within the window. Otherwise the most recent terminal run's end/start
+    time is compared against the window. A window of None ("Ever") means any
+    activity counts.
+    """
+    if not entries:
+        return None
+
+    def _effective(e: ProjectActivity) -> datetime:
+        if e.phase not in TERMINAL_PHASES:
+            return now
+        return e.last_activity or datetime.min.replace(tzinfo=timezone.utc)
+
+    newest = max(entries, key=_effective)
+    if window_hours is None:
+        return newest.phase
+    cutoff = now - timedelta(hours=window_hours)
+    return newest.phase if _effective(newest) >= cutoff else None
+
+
 class UnionStatusApp(rumps.App):
     def __init__(self) -> None:
         # rumps requires *something* as the initial title so the status item
@@ -542,7 +579,9 @@ class UnionStatusApp(rumps.App):
         self.runs: list[RunRow] = []
         self.apps: list[AppRow] = []
         self.available_pairs: list[tuple[str, str]] = []
-        self.last_activity: dict[tuple[str, str], datetime] = {}
+        # Most-recent run per (project, domain), for the Project picker's
+        # activity dots. Populated by _refresh_project_activity.
+        self.last_activity: dict[tuple[str, str], ProjectActivity] = {}
         # Per-run recent-task summary, keyed by (project, domain, run_name).
         self.summary_cache: dict[tuple[str, str, str], list[ActionLite]] = {}
         self.window_label: str = window
@@ -558,9 +597,11 @@ class UnionStatusApp(rumps.App):
         self.menu = [
             "Loading…",
             None,
+            # Order reflects selection precedence: time window narrows what the
+            # project & environment dots summarize, so it sits on top.
+            self._window_menu,
             self._projects_menu,
             self._envs_menu,
-            self._window_menu,
             rumps.MenuItem("Refresh now", callback=self._on_refresh_click),
             rumps.MenuItem("Open Union UI", callback=self._on_open_ui),
             None,
@@ -704,6 +745,9 @@ class UnionStatusApp(rumps.App):
                     )
                     self.last_refresh = datetime.now(timezone.utc)
                     self._pending_render = True
+                # Even with nothing scoped yet, fill the picker's activity dots
+                # so the user can spot a busy project to switch into.
+                self._refresh_project_activity(available)
                 return
 
             rows: list[RunRow] = []
@@ -763,6 +807,10 @@ class UnionStatusApp(rumps.App):
             # actually display. Runs in progress are always re-fetched; finished
             # runs are cached for the life of the process.
             self._refresh_run_summaries(rows)
+
+            # Per-project activity for the Project picker's status dots. Runs
+            # after the primary content so the main menu populates first.
+            self._refresh_project_activity(available)
         except Exception as exc:  # noqa: BLE001
             # Force re-init on the next refresh: the gRPC channel may have
             # wedged during a network blip (captive portal, sleep/wake,
@@ -855,6 +903,56 @@ class UnionStatusApp(rumps.App):
             self.summary_cache.update(new)
             self._pending_render = True
 
+    def _refresh_project_activity(self, pairs: list[tuple[str, str]]) -> None:
+        """Fetch the most-recent run for every (project, domain) pair so the
+        Project picker can show a per-project activity dot. One lightweight
+        limit=1 query per pair, fanned out in parallel. A failed pair simply
+        has no activity recorded (→ idle dot) and never blocks the menu;
+        successes only overwrite prior values so a transient network blip
+        doesn't blank existing dots.
+        """
+        if not pairs:
+            return
+
+        async def _activity_of(
+            project: str, domain: str
+        ) -> Optional[tuple[tuple[str, str], ProjectActivity]]:
+            try:
+                async for r in Run.listall.aio(
+                    project=project,
+                    domain=domain,
+                    sort_by=("created_at", "desc"),
+                    limit=1,
+                ):
+                    started, ended = _parse_times(r)
+                    return (project, domain), ProjectActivity(
+                        phase=r.phase, last_activity=ended or started
+                    )
+            except Exception:
+                return None
+            return None
+
+        async def _fetch_all():
+            return await asyncio.gather(
+                *(_activity_of(p, d) for p, d in pairs)
+            )
+
+        # Fresh event loop on this worker thread (see _refresh_run_summaries).
+        results = asyncio.run(_fetch_all())
+
+        new: dict[tuple[str, str], ProjectActivity] = {}
+        for res in results:
+            if res:
+                key, act = res
+                new[key] = act
+
+        if not new:
+            return
+
+        with self._lock:
+            self.last_activity.update(new)
+            self._pending_render = True
+
     # ---------- render ----------
 
     def _render(self) -> None:
@@ -862,6 +960,7 @@ class UnionStatusApp(rumps.App):
             all_runs = list(self.runs)
             all_apps = list(self.apps)
             available = list(self.available_pairs)
+            activity = dict(self.last_activity)
             error = self.error
             last_refresh = self.last_refresh
 
@@ -877,8 +976,8 @@ class UnionStatusApp(rumps.App):
             if key not in static:
                 del self.menu[key]
 
-        self._build_projects_menu(available)
-        self._build_envs_menu(available)
+        self._build_projects_menu(available, activity)
+        self._build_envs_menu(available, activity)
 
         # Header (top of menu): which project/domain we're showing. Inserted
         # first so it ends up above everything else. insert_before places
@@ -886,23 +985,23 @@ class UnionStatusApp(rumps.App):
         # farthest from the anchor.
         if self.project and self.domain:
             self.menu.insert_before(
-                "Project",
+                "Time window",
                 rumps.MenuItem(f"Showing: {self.project}/{self.domain}"),
             )
-            self.menu.insert_before("Project", None)
+            self.menu.insert_before("Time window", None)
 
         if error:
             self._set_status_title(error=True)
             self.menu.insert_before(
-                "Project", rumps.MenuItem(f"Error: {error[:100]}")
+                "Time window", rumps.MenuItem(f"Error: {error[:100]}")
             )
             self.menu.insert_before(
-                "Project",
+                "Time window",
                 rumps.MenuItem(
                     "Reset connection", callback=self._on_reset_connection
                 ),
             )
-            self.menu.insert_before("Project", None)
+            self.menu.insert_before("Time window", None)
             return
 
         # Time-window filter. A run qualifies if it is currently running, or if
@@ -938,21 +1037,21 @@ class UnionStatusApp(rumps.App):
 
         if not runs:
             self.menu.insert_before(
-                "Project",
+                "Time window",
                 rumps.MenuItem(f"No runs in {self.window_label.lower()}"),
             )
         else:
             self._render_groups(runs)
 
         if all_apps:
-            self.menu.insert_before("Project", None)
+            self.menu.insert_before("Time window", None)
             self.menu.insert_before(
-                "Project", rumps.MenuItem("Active apps")
+                "Time window", rumps.MenuItem("Active apps")
             )
             for a in sorted(all_apps, key=lambda x: x.name):
                 self._render_app_row(a)
 
-        self.menu.insert_before("Project", None)
+        self.menu.insert_before("Time window", None)
 
         # Footer: just the last-refresh timestamp, rendered above Quit.
         if last_refresh:
@@ -1066,7 +1165,7 @@ class UnionStatusApp(rumps.App):
                 sub_item._menuitem.setAttributedTitle_(sub_attr)
                 group_item.add(sub_item)
 
-            self.menu.insert_before("Project", group_item)
+            self.menu.insert_before("Time window", group_item)
 
     def _render_app_row(self, a: AppRow) -> None:
         # Primary click opens the exposed endpoint; the submenu lists both
@@ -1114,7 +1213,7 @@ class UnionStatusApp(rumps.App):
                     callback=self._make_opener(a.console_url),
                 )
             )
-        self.menu.insert_before("Project", item)
+        self.menu.insert_before("Time window", item)
 
     def _build_window_menu(self) -> None:
         for label, _ in TIME_WINDOWS:
@@ -1124,7 +1223,9 @@ class UnionStatusApp(rumps.App):
             self._window_menu[label] = item
 
     def _build_projects_menu(
-        self, available: list[tuple[str, str]]
+        self,
+        available: list[tuple[str, str]],
+        activity: dict[tuple[str, str], ProjectActivity],
     ) -> None:
         for key in list(self._projects_menu.keys()):
             del self._projects_menu[key]
@@ -1136,14 +1237,30 @@ class UnionStatusApp(rumps.App):
         if not names:
             self._projects_menu["Loading…"] = rumps.MenuItem("Loading…")
             return
+        # Activity dot reflects the project's most recent run across all its
+        # domains, within the selected time window (applied here at render
+        # time, so changing the window recolors without a refetch).
+        window_hours = _window_hours(self.window_label)
+        now = datetime.now(timezone.utc)
         for name in names:
-            item = rumps.MenuItem(name, callback=self._on_pick_project)
+            entries = [
+                act for (proj, _dom), act in activity.items() if proj == name
+            ]
+            phase = _project_dot_phase(entries, window_hours, now)
+            dot_char = DOT_CHAR if phase is not None else "○"
+            item = rumps.MenuItem(
+                f"{dot_char} {name}", callback=self._on_pick_project
+            )
             item._project = name
             item.state = 1 if name == self.project else 0
+            # _build_title renders the same hollow/colored dot + label.
+            item._menuitem.setAttributedTitle_(_build_title(phase, name))
             self._projects_menu[name] = item
 
     def _build_envs_menu(
-        self, available: list[tuple[str, str]]
+        self,
+        available: list[tuple[str, str]],
+        activity: dict[tuple[str, str], ProjectActivity],
     ) -> None:
         for key in list(self._envs_menu.keys()):
             del self._envs_menu[key]
@@ -1153,10 +1270,23 @@ class UnionStatusApp(rumps.App):
         if not names:
             self._envs_menu["Loading…"] = rumps.MenuItem("Loading…")
             return
+        # Dot per environment = latest run status for the *selected project* in
+        # that environment, within the selected time window. Scoped to the
+        # current project, unlike the Project picker which aggregates domains.
+        window_hours = _window_hours(self.window_label)
+        now = datetime.now(timezone.utc)
         for name in names:
-            item = rumps.MenuItem(name, callback=self._on_pick_env)
+            act = (
+                activity.get((self.project, name)) if self.project else None
+            )
+            phase = _project_dot_phase([act] if act else [], window_hours, now)
+            dot_char = DOT_CHAR if phase is not None else "○"
+            item = rumps.MenuItem(
+                f"{dot_char} {name}", callback=self._on_pick_env
+            )
             item._domain = name
             item.state = 1 if name == self.domain else 0
+            item._menuitem.setAttributedTitle_(_build_title(phase, name))
             self._envs_menu[name] = item
 
     def _set_status_title(
