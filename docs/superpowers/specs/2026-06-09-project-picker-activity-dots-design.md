@@ -178,8 +178,22 @@ Add a focused unit test for the pure helper `_project_dot_phase`:
 `tests/__pycache__/` — so this adds the first tracked test alongside the new
 pure helper.)
 
-## Out of scope
+## Addendum (follow-on changes)
 
-- Activity dots on the **Environment** menu. The per-pair data would make this
-  an easy follow-on (per-domain dots), but this change is limited to the
-  Project picker as requested.
+Two extensions requested after the initial implementation landed:
+
+1. **Environment dots, scoped to the selected project.** The Environment
+   picker now shows a status dot per environment reflecting the latest run for
+   the **currently-selected project** in that environment, within the selected
+   time window. Unlike the Project picker (which aggregates across domains),
+   this is scoped to one `(self.project, domain)` entry per row, looked up
+   straight from the already-fetched `self.last_activity` — no new queries.
+   Reuses `_project_dot_phase` (with a 0- or 1-element list) and `_build_title`.
+   When no project is selected, all environments render the idle `○`.
+
+2. **Selector precedence ordering.** The three selectors are reordered to
+   **Time window → Project → Environment** to reflect selection precedence (the
+   window narrows what the project/environment dots summarize). Implemented by
+   reordering the `self.menu` list in `__init__` and repointing every
+   render-time `insert_before` anchor from `"Project"` to `"Time window"`, so
+   the dynamic run/app content stays above the grouped selector block.
